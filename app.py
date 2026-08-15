@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import math
 import urllib.parse
 import urllib.request
 import numpy as np
@@ -227,14 +226,11 @@ if st.sidebar.button("Launch Scan", type="primary"):
     )
 
     with st.spinner("Analyzing Binance market data..."):
-        # Safely run asyncio scanner inside Streamlit
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            signals = loop.run_until_complete(
+            # Clean execution inside Streamlit's thread environment
+            signals = asyncio.run(
                 scanner.run_scan(interval=interval, max_concurrent=max_concurrency)
             )
-            loop.close()
         except Exception as e:
             st.error(f"Scan failed due to an execution error: {e}")
             signals = []
