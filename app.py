@@ -1,84 +1,163 @@
 import asyncio
-import logging
-import threading
+import sys
+from pathlib import Path
+import pandas as pd
 import streamlit as st
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Ensure local module path resolution
+sys.path.append(str(Path(__file__).parent.resolve()))
 
-# --- 1. SAFE IMPORT / DEFINITION OF PREDICTIVESCANNER ---
 try:
-    # Adjust this import to match where PredictiveScanner actually lives
-    # e.g., from scanner import PredictiveScanner
-    from scanner import PredictiveScanner  
+    from scanner import PredictiveScanner
 except ImportError:
-    logger.warning("PredictiveScanner module not found. Using dummy fallback scanner.")
+    st.error(
+        "Could not find `scanner.py`. Please make sure `scanner.py` is in the same directory as `app.py`."
+    )
+    st.stop()
 
-    class PredictiveScanner:
-        """Fallback implementation to prevent NameError runtime crashes."""
-        def __init__(self, asset: str, tf: str):
-            self.asset = asset
-            self.tf = tf
+# Page configuration
+st.set_page_config(
+    page_title="Predictive Market Scanner",
+    page_icon="📈",
+    layout="wide",
+)
 
-        async def scan(self):
-            logger.info(f"Scanning {self.asset} on timeframe {self.tf}...")
-            await asyncio.sleep(1)
+st.title("📈 Predictive Market Scanner")
+st.caption("Scan Binance USDT pairs for ADX trend strength, volume expansion, and moving average alignment.")
+
+# Sidebar Settings
+st.sidebar.header("Scanner Settings")
+
+interval = st.sidebar.selectbox(
+    "Timeframe Interval",
+    options=["15m", "1h", "4h", "1d"],
+    index=1,
+)
+
+min_vol_millions = st.sidebar.slider(
+    "Min 24h Volume (USDT Millions)",
+    min_value=1.0,
+    max_value=50.0,
+    value=10.0,
+    step=1.0,
+)
+
+volume_multiplier = st.sidebar.slider(
+    "Volume Gate Multiplier (vs SMA)",
+    min_value=1.0,
+    max_value=3.0,
+    value=1.5,
+    step=0.1,
+)
+
+adx_cutoff = st.sidebar.slider(
+    "Min ADX Threshold",
+    min_value=15.0,
+    max_value=50.0,
+    value=25.0,
+    step=1.0,
+)
+
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    short_lb = st.number_input("Short Lookback", min_value=5, max_value=50, value=20)
+with col2:
+    long_lb = st.number_input("Long Lookback", min_value=20, max_value=200, value=50)
+
+max_concurrency = st.sidebar.slider(
+    "Max Concurrent API Requests",
+    min_value=5,
+    max_value=30,
+    value=15,
+)
+
+st.sidebar.markdown("---")
+run_button = st.sidebar.button("🚀 Run Market Scan", use_container_width=True)
 
 
-# --- 2. ASYNC STREAM HANDLER ---
-async def mock_or_real_stream_handler(asset: str, tf: str):
-    """Handles continuous scanning or streaming logic per asset/timeframe."""
+# Core Async Execution Wrapper
+def execute_scan():
+    scanner = PredictiveScanner(
+        min_24h_volume_usdt=min_vol_millions * 1_000_000.0,
+        volume_gate_multiplier=volume_multiplier,
+        adx_threshold=adx_cutoff,
+        short_lookback=int(short_lb),
+        long_lookback=int(long_lb),
+    )
+    # Handle event loop execution safely
     try:
-        scanner = PredictiveScanner(asset, tf)
-        if hasattr(scanner, "scan"):
-            await scanner.scan()
-    except Exception as e:
-        logger.error(f"Error in stream handler for {asset} ({tf}): {e}")
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    return loop.run_until_complete(
+        scanner.run_scan(interval=interval, max_concurrent=int(max_concurrency))
+    )
 
 
-async def run_all():
-    """Defines and runs all async background tasks."""
-    # Add your target assets/timeframes here
-    assets_and_tfs = [("BTC/USD", "1h"), ("ETH/USD", "15m")] 
-    tasks = [
-        mock_or_real_stream_handler(asset, tf) 
-        for asset, tf in assets_and_tfs
-    ]
-    await asyncio.gather(*tasks)
+# Dashboard Main View
+if run_button:
+    with st.spinner(f"Scanning Binance USDT pairs on {interval} timeframe..."):
+        try:
+            results = execute_scan()
+            st.session_state["scan_results"] = results
+            st.session_state["last_interval"] = interval
+        except Exception as e:
+            st.error(f"Error executing scan: {e}")
 
+if "scan_results" in st.session_state:
+    results = st.session_state["scan_results"]
+    selected_tf = st.session_state.get("last_interval", interval)
 
-# --- 3. BACKGROUND THREAD LIFECYCLE ---
-def start_background_loop():
-    """Runs the asyncio loop safely within a dedicated thread."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(run_all())
-    except Exception as e:
-        logger.error(f"Background thread loop encountered an error: {e}")
-    finally:
-        loop.close()
+    st.subheader(f"Results for {selected_tf} Timeframe")
 
+    if not results:
+        st.warning("No market setups passed all criteria with the current settings.")
+    else:
+        df_results = pd.DataFrame(results)
 
-@st.cache_resource
-def initialize_background_tasks():
-    """Ensures the background loop thread starts only ONCE per Streamlit session."""
-    thread = threading.Thread(target=start_background_loop, daemon=True, name="BackgroundScannerThread")
-    thread.start()
-    return thread
+        # Top Summary Metrics
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Qualified Setups", len(df_results))
+        m2.metric("Highest ADX Pair", df_results.iloc[0]["symbol"])
+        m3.metric("Peak ADX Value", f"{df_results.iloc[0]['adx']:.2f}")
 
+        st.markdown("### Actionable Setups")
 
-# --- 4. STREAMLIT APP LAYOUT ---
-def main():
-    st.set_page_config(page_title="Gipsy AI", layout="wide")
-    st.title("Gipsy AI Dashboard")
+        # Format dataframe for presentation
+        display_df = df_results[
+            [
+                "symbol",
+                "close",
+                "adx",
+                "current_volume",
+                "volume_threshold",
+                "sma_short",
+                "sma_long",
+            ]
+        ].copy()
 
-    # Start background tasks
-    initialize_background_tasks()
+        display_df.columns = [
+            "Symbol",
+            "Price (USDT)",
+            "ADX",
+            "Current Vol",
+            "Vol Threshold",
+            "Short SMA",
+            "Long SMA",
+        ]
 
-    st.success("Background scanner thread running smoothly!")
-    st.info("Check app logs if custom modules need adjustment.")
+        st.dataframe(
+            display_df.style.highlight_max(axis=0, subset=["ADX"], color="#1f77b422"),
+            use_container_width=True,
+        )
 
-if __name__ == "__main__":
-    main()
+        st.download_button(
+            label="📥 Download CSV Report",
+            data=display_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"scan_results_{selected_tf}.csv",
+            mime="text/csv",
+        )
+else:
+    st.info("Click **Run Market Scan** in the sidebar to fetch real-time market opportunities.")
