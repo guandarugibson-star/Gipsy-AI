@@ -1,16 +1,9 @@
 import asyncio
-import json
 import logging
-import math
-
 import aiohttp
-import nest_asyncio
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-# Apply nest_asyncio to prevent event loop issues within Streamlit
-nest_asyncio.apply()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,7 +11,6 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 # Core Predictive Scanner Engine
 # ------------------------------------------------------------------
-
 
 class PredictiveScanner:
     """Predictive market scanner equipped with ADX trend filtering,
@@ -357,14 +349,8 @@ if st.sidebar.button("🚀 Start Market Scan", type="primary"):
         progress_bar.progress(pct)
         status_text.text(f"Scanning market pairs... {current}/{total}")
 
-    # Run the async scan loop safely
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    signals = loop.run_until_complete(
+    # Standard asyncio run execution
+    signals = asyncio.run(
         scanner.run_scan(
             interval=kline_interval,
             max_concurrent=max_threads,
@@ -428,5 +414,5 @@ if st.sidebar.button("🚀 Start Market Scan", type="primary"):
     else:
         st.warning(
             "No market pairs met all criteria or the API response returned no valid symbols. Try lowering thresholds in the sidebar."
-    )
-                      
+        )
+        
