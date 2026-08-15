@@ -151,12 +151,20 @@ class PredictiveScanner:
         tickers = await self._fetch_json(session, endpoint)
 
         valid_symbols = []
-        for t in tickers:
-            symbol = t.get("symbol", "")
-            quote_vol = float(t.get("quoteVolume", 0.0))
 
-            if symbol.endswith("USDT") and quote_vol >= self.min_24h_volume_usdt:
-                valid_symbols.append(symbol)
+        # Ensure response is a list before iterating
+        if isinstance(tickers, list):
+            for t in tickers:
+                # Type check to ensure element is a dictionary
+                if isinstance(t, dict):
+                    symbol = t.get("symbol", "")
+                    try:
+                        quote_vol = float(t.get("quoteVolume", 0.0))
+                    except (ValueError, TypeError):
+                        quote_vol = 0.0
+
+                    if symbol.endswith("USDT") and quote_vol >= self.min_24h_volume_usdt:
+                        valid_symbols.append(symbol)
 
         return valid_symbols
 
@@ -165,6 +173,9 @@ class PredictiveScanner:
     ) -> pd.DataFrame:
         endpoint = f"{self.base_url}/api/v3/klines?symbol={symbol}&interval={interval}&limit={self.kline_limit}"
         raw_klines = await self._fetch_json(session, endpoint)
+
+        if not isinstance(raw_klines, list):
+            return pd.DataFrame()
 
         df = pd.DataFrame(
             raw_klines,
@@ -198,9 +209,12 @@ class PredictiveScanner:
     ) -> dict | None:
         try:
             df = await self.fetch_klines(session, symbol, interval=interval)
+            if df.empty:
+                return None
+
             filter_res = self.apply_technical_filters(df)
 
-            if filter_res["passed"]:
+            if filter_res.get("passed", False):
                 return {"symbol": symbol, **filter_res["metrics"]}
         except Exception as e:
             logger.error(f"Error scanning {symbol}: {e}")
@@ -214,23 +228,22 @@ class PredictiveScanner:
     ) -> list[dict]:
         async with aiohttp.ClientSession() as session:
             symbols = await self.fetch_active_usdt_pairs(session)
-            total_symbols = len(symbols)
+            total = len(symbols)
 
-            if total_symbols == 0:
+            if total == 0:
                 return []
 
             semaphore = asyncio.Semaphore(max_concurrent)
-            completed = 0
+            counter = [0]
 
             async def _bounded_scan(sym):
-                nonlocal completed
                 async with semaphore:
                     res = await self.scan_symbol(
                         session, sym, interval=interval
                     )
-                    completed += 1
+                    counter[0] += 1
                     if progress_callback:
-                        progress_callback(completed, total_symbols)
+                        progress_callback(counter[0], total)
                     return res
 
             tasks = [_bounded_scan(sym) for sym in symbols]
@@ -317,7 +330,7 @@ if st.sidebar.button("🚀 Start Market Scan", type="primary"):
     status_text = st.empty()
 
     def update_progress(current, total):
-        pct = current / total
+        pct = current / total if total > 0 else 0.0
         progress_bar.progress(pct)
         status_text.text(f"Scanning market pairs... {current}/{total}")
 
@@ -385,5 +398,7 @@ if st.sidebar.button("🚀 Start Market Scan", type="primary"):
         )
     else:
         st.warning(
-            "No market pairs met all criteria. Try lowering the ADX or volume gate thresholds."
-        )
+            "No market pairs met all criteria or the API response returned no valid symbols. Try adjusting thresholds."
+    )
+
+
