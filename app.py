@@ -4,9 +4,13 @@ import logging
 import math
 
 import aiohttp
+import nest_asyncio
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+# Apply nest_asyncio to prevent event loop issues within Streamlit
+nest_asyncio.apply()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 class PredictiveScanner:
     """Predictive market scanner equipped with ADX trend filtering,
-
     volume gating, and dynamic lookbacks to detect high-probability setups.
     """
 
@@ -141,8 +144,16 @@ class PredictiveScanner:
         self, session: aiohttp.ClientSession, url: str
     ) -> dict | list:
         headers = {"User-Agent": "PredictiveScannerApp/1.0"}
-        async with session.get(url, headers=headers, timeout=10) as response:
-            return await response.json()
+        try:
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    return await response.json()
+                text = await response.text()
+                logger.error(f"API Error ({response.status}) on {url}: {text}")
+                return []
+        except Exception as e:
+            logger.error(f"Network error fetching {url}: {e}")
+            return []
 
     async def fetch_active_usdt_pairs(
         self, session: aiohttp.ClientSession
@@ -152,19 +163,30 @@ class PredictiveScanner:
 
         valid_symbols = []
 
-        # Ensure response is a list before iterating
-        if isinstance(tickers, list):
-            for t in tickers:
-                # Type check to ensure element is a dictionary
-                if isinstance(t, dict):
-                    symbol = t.get("symbol", "")
-                    try:
-                        quote_vol = float(t.get("quoteVolume", 0.0))
-                    except (ValueError, TypeError):
-                        quote_vol = 0.0
+        # Safe guard to handle unexpected string/dict error responses from Binance
+        if not isinstance(tickers, list):
+            logger.error(
+                f"Expected list from Binance 24hr ticker, got {type(tickers)}: {tickers}"
+            )
+            return valid_symbols
 
-                    if symbol.endswith("USDT") and quote_vol >= self.min_24h_volume_usdt:
-                        valid_symbols.append(symbol)
+        for t in tickers:
+            if not isinstance(t, dict):
+                continue
+
+            symbol = t.get("symbol", "")
+            try:
+                quote_vol = float(t.get("quoteVolume", 0.0))
+            except (ValueError, TypeError):
+                quote_vol = 0.0
+
+            # Filter valid spot USDT pairs and exclude leveraged tokens
+            if (
+                symbol.endswith("USDT")
+                and not any(symbol.endswith(x) for x in ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"])
+                and quote_vol >= self.min_24h_volume_usdt
+            ):
+                valid_symbols.append(symbol)
 
         return valid_symbols
 
@@ -174,7 +196,7 @@ class PredictiveScanner:
         endpoint = f"{self.base_url}/api/v3/klines?symbol={symbol}&interval={interval}&limit={self.kline_limit}"
         raw_klines = await self._fetch_json(session, endpoint)
 
-        if not isinstance(raw_klines, list):
+        if not isinstance(raw_klines, list) or len(raw_klines) == 0:
             return pd.DataFrame()
 
         df = pd.DataFrame(
@@ -196,9 +218,10 @@ class PredictiveScanner:
         )
 
         numeric_cols = ["open", "high", "low", "close", "volume"]
-        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, axis=1)
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
         return df
 
     async def scan_symbol(
@@ -282,7 +305,7 @@ kline_interval = st.sidebar.selectbox(
 min_volume = st.sidebar.number_input(
     "Min 24h Volume (USDT)",
     min_value=1_000_000.0,
-    max_value=100_000_000.0,
+    max_value=500_000_000.0,
     value=10_000_000.0,
     step=1_000_000.0,
     format="%.0f",
@@ -334,8 +357,14 @@ if st.sidebar.button("🚀 Start Market Scan", type="primary"):
         progress_bar.progress(pct)
         status_text.text(f"Scanning market pairs... {current}/{total}")
 
-    # Run the async scan loop
-    signals = asyncio.run(
+    # Run the async scan loop safely
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    signals = loop.run_until_complete(
         scanner.run_scan(
             interval=kline_interval,
             max_concurrent=max_threads,
@@ -398,7 +427,6 @@ if st.sidebar.button("🚀 Start Market Scan", type="primary"):
         )
     else:
         st.warning(
-            "No market pairs met all criteria or the API response returned no valid symbols. Try adjusting thresholds."
+            "No market pairs met all criteria or the API response returned no valid symbols. Try lowering thresholds in the sidebar."
     )
-
-
+                      
