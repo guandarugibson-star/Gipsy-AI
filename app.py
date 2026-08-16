@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import urllib.error
 import urllib.parse
 import urllib.request
 import numpy as np
@@ -11,7 +12,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =====================================================================
-# CORE SMC SCANNER ENGINE
+# CORE SMC SCANNER ENGINE (ROBUST & RESILIENT)
 # =====================================================================
 
 class HighAccuracySMCScanner:
@@ -24,7 +25,15 @@ class HighAccuracySMCScanner:
         ltf_interval: str = "1h",
         kline_limit: int = 200,
     ):
-        self.base_url = base_url.rstrip("/")
+        # List of alternative Binance API mirrors for failover/IP bypass
+        self.fallback_urls = [
+            base_url.rstrip("/"),
+            "https://api1.binance.com",
+            "https://api2.binance.com",
+            "https://api3.binance.com",
+            "https://data-api.binance.vision",
+        ]
+        self.current_base_idx = 0
         self.min_24h_volume_usdt = min_24h_volume_usdt
         self.adx_threshold = adx_threshold
         self.htf_interval = htf_interval
@@ -37,6 +46,14 @@ class HighAccuracySMCScanner:
             "ltf_entry_passed": 0,
             "errors": 0,
         }
+
+    @property
+    def base_url(self) -> str:
+        return self.fallback_urls[self.current_base_idx]
+
+    def _rotate_domain(self):
+        self.current_base_idx = (self.current_base_idx + 1) % len(self.fallback_urls)
+        logger.warning(f"Rotating Binance API domain to: {self.base_url}")
 
     @staticmethod
     def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -99,7 +116,6 @@ class HighAccuracySMCScanner:
         ltf_df["atr"] = self.calculate_atr(ltf_df)
         ltf_df["atr_sma"] = ltf_df["atr"].rolling(20).mean()
         
-        # Validating signal alignment on completed closed candle
         atr_expansion = ltf_df["atr"].iloc[-2] >= (ltf_df["atr_sma"].iloc[-2] * 1.15)
         atr_val = float(ltf_df["atr"].iloc[-2])
 
@@ -108,13 +124,11 @@ class HighAccuracySMCScanner:
         direction = "NONE"
         stop_loss, take_profit = 0.0, 0.0
 
-        # Bullish Signals
         recent_lows = ltf_df["low"].iloc[-14:-3]
         bull_liquidity_swept = ltf_df["low"].iloc[-3] < (recent_lows.min() if len(recent_lows) > 0 else 0)
         bull_bos = ltf_df["close"].iloc[-2] > ltf_df["high"].iloc[-20:-3].max()
         bull_fvg = ltf_df["low"].iloc[-2] > ltf_df["high"].iloc[-4]
 
-        # Bearish Signals
         recent_highs = ltf_df["high"].iloc[-14:-3]
         bear_liquidity_swept = ltf_df["high"].iloc[-3] > (recent_highs.max() if len(recent_highs) > 0 else 0)
         bear_bos = ltf_df["close"].iloc[-2] < ltf_df["low"].iloc[-20:-3].min()
@@ -153,29 +167,52 @@ class HighAccuracySMCScanner:
             },
         }
 
-    async def _async_get_json(self, url: str) -> dict | list:
-        def _fetch():
-            req = urllib.request.Request(
-                url, 
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                    "Accept": "application/json"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        return await asyncio.to_thread(_fetch)
+    async def _async_get_json(self, path: str) -> dict | list:
+        """Fetches JSON with retries, domain switching, and safe HTTP exception handling."""
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            url = f"{self.base_url}{path}"
+            
+            def _fetch():
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept": "application/json",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+
+            try:
+                return await asyncio.to_thread(_fetch)
+            except urllib.error.HTTPError as e:
+                logger.warning(f"HTTP {e.code} on {url} (Attempt {attempt + 1}/{max_retries})")
+                self.debug_stats["errors"] += 1
+                
+                # Rotate domain on 451 (geoblock), 403 (forbidden), or 429 (rate limit)
+                if e.code in (403, 451, 429):
+                    self._rotate_domain()
+                await asyncio.sleep(0.5 * (attempt + 1))
+            except Exception as e:
+                logger.error(f"Network error on {url}: {e}")
+                self.debug_stats["errors"] += 1
+                await asyncio.sleep(0.5)
+
+        return []
 
     async def fetch_active_usdt_pairs(self) -> list[str]:
-        endpoint = f"{self.base_url}/api/v3/ticker/24hr"
-        tickers = await self._async_get_json(endpoint)
+        tickers = await self._async_get_json("/api/v3/ticker/24hr")
+        if not isinstance(tickers, list):
+            return []
+
         self.debug_stats["total_pairs"] = len(tickers)
         
         valid_symbols = []
         for t in tickers:
             symbol = t.get("symbol", "")
             quote_vol = float(t.get("quoteVolume", 0.0))
-            # Exclude leveraged token pairs and non-USDT pairs
             if (
                 symbol.endswith("USDT") 
                 and not any(x in symbol for x in ["UPUSDT", "DOWNUSDT", "BEARUSDT", "BULLUSDT"])
@@ -188,10 +225,9 @@ class HighAccuracySMCScanner:
 
     async def fetch_klines(self, symbol: str, interval: str) -> pd.DataFrame:
         params = urllib.parse.urlencode({"symbol": symbol, "interval": interval, "limit": self.kline_limit})
-        endpoint = f"{self.base_url}/api/v3/klines?{params}"
-        raw_klines = await self._async_get_json(endpoint)
+        raw_klines = await self._async_get_json(f"/api/v3/klines?{params}")
         
-        if not raw_klines:
+        if not raw_klines or not isinstance(raw_klines, list):
             return pd.DataFrame()
 
         df = pd.DataFrame(
@@ -239,8 +275,11 @@ class HighAccuracySMCScanner:
             logger.error(f"Error scanning {symbol}: {e}")
         return None
 
-    async def run_scan(self, max_concurrent: int = 12) -> tuple[list[dict], dict]:
+    async def run_scan(self, max_concurrent: int = 10) -> tuple[list[dict], dict]:
         symbols = await self.fetch_active_usdt_pairs()
+        if not symbols:
+            return [], self.debug_stats
+
         semaphore = asyncio.Semaphore(max_concurrent)
 
         async def _bounded_scan(sym):
@@ -253,107 +292,4 @@ class HighAccuracySMCScanner:
         signals = [res for res in results if isinstance(res, dict) and res is not None]
         sorted_signals = sorted(signals, key=lambda x: x["htf_adx"], reverse=True)
         return sorted_signals, self.debug_stats
-
-
-# =====================================================================
-# STREAMLIT UI LAYOUT
-# =====================================================================
-
-st.set_page_config(
-    page_title="High-Accuracy SMC Scanner",
-    page_icon="⚡",
-    layout="wide"
-)
-
-st.title("⚡ High-Accuracy SMC Crypto Scanner")
-st.markdown("Automated Multi-Timeframe Smart Money Concepts Scanner with **ADX Trend Alignment**, **Liquidity Sweeps**, and **ATR Volatility Expansion**.")
-
-# Sidebar Settings
-st.sidebar.header("⚙️ Scanner Settings")
-min_volume = st.sidebar.number_input("Min 24h Volume (USDT)", value=20_000_000.0, step=5_000_000.0, format="%.0f")
-adx_val = st.sidebar.slider("HTF ADX Threshold", min_value=15.0, max_value=40.0, value=25.0, step=1.0)
-
-col_htf, col_ltf = st.sidebar.columns(2)
-with col_htf:
-    htf_select = st.selectbox("HTF Interval", ["4h", "1d"], index=0)
-with col_ltf:
-    ltf_select = st.selectbox("LTF Interval", ["1h", "15m", "5m"], index=0)
-
-concurrent_tasks = st.sidebar.slider("Max Concurrent Scans", min_value=3, max_value=20, value=10)
-show_debug = st.sidebar.checkbox("Show Diagnostic Logs", value=True)
-
-# Async Helper function safe for Streamlit's event loop
-def execute_async_scan(scanner_obj, tasks_limit):
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    if loop.is_running():
-        # Handle active event loops in Streamlit Cloud / server instances
-        import nest_asyncio
-        nest_asyncio.apply()
-        return loop.run_until_complete(scanner_obj.run_scan(max_concurrent=tasks_limit))
-    else:
-        return loop.run_until_complete(scanner_obj.run_scan(max_concurrent=tasks_limit))
-
-# Main Scanner Trigger
-if st.button("🚀 Run SMC Market Scan", use_container_width=True):
-    with st.spinner("Connecting to Binance API and running scan..."):
-        scanner = HighAccuracySMCScanner(
-            min_24h_volume_usdt=min_volume,
-            adx_threshold=adx_val,
-            htf_interval=htf_select,
-            ltf_interval=ltf_select,
-        )
-        signals, stats = execute_async_scan(scanner, concurrent_tasks)
-
-    # Diagnostic Metrics Panel
-    if show_debug:
-        st.subheader("🔍 Scan Diagnostics")
-        d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("Binance Tickers", stats["total_pairs"])
-        d2.metric("Vol Filter Passed", stats["volume_passed"])
-        d3.metric("HTF Bias Passed", stats["htf_bias_passed"])
-        d4.metric("LTF Entry Passed", stats["ltf_entry_passed"])
-        d5.metric("API Errors", stats["errors"], delta_color="inverse")
-        st.divider()
-
-    # Data Presentation
-    if signals:
-        st.success(f"🎯 Found {len(signals)} Active SMC Setup(s)!")
-        
-        df_display = pd.DataFrame(signals)
-        df_display = df_display[[
-            "symbol", "direction", "htf_bias", "htf_adx", 
-            "entry_price", "stop_loss", "take_profit", "risk_reward"
-        ]]
-        df_display.columns = [
-            "Symbol", "Direction", "HTF Bias", "HTF ADX", 
-            "Entry Price", "Stop Loss", "Take Profit", "Target R:R"
-        ]
-
-        st.dataframe(
-            df_display.style.highlight_max(subset=["HTF ADX"], color="#1b5e20"),
-            use_container_width=True,
-        )
-    else:
-        st.warning("⚠️ No cryptocurrency pairs matched all entry requirements.")
-        
-        # Actionable diagnostic suggestions when 0 pairs pass
-        with st.expander("💡 Why was the result empty?", expanded=True):
-            st.write(
-                """
-                Strict Smart Money Concepts strategies demand three factors to align simultaneously:
-                1. **HTF ADX Trend Strength:** Currently looking for ADX >= **{}**. Lower this slider to **20** if the market is consolidating.
-                2. **Liquidity Sweep + BOS:** A structure break and liquidity sweep must occur on the **most recently closed candle**.
-                3. **ATR Expansion:** Volatility must spike by at least 15% on the signal candle.
-                
-                **Quick Solutions:**
-                * Lower **HTF ADX Threshold** in the sidebar.
-                * Adjust **Min 24h Volume** lower to scan altcoins with lower market caps.
-                * Set **LTF Interval** to **15m** or **5m** to catch faster setups.
-                """.format(adx_val)
-    )
-        
+                    
