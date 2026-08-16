@@ -292,4 +292,74 @@ class HighAccuracySMCScanner:
         signals = [res for res in results if isinstance(res, dict) and res is not None]
         sorted_signals = sorted(signals, key=lambda x: x["htf_adx"], reverse=True)
         return sorted_signals, self.debug_stats
-                    
+
+# =====================================================================
+# STREAMLIT USER INTERFACE & EXECUTION
+# =====================================================================
+
+st.set_page_config(page_title="SMC Crypto Scanner", page_icon="📈", layout="wide")
+
+st.title("⚡ Multi-Timeframe SMC Scanner")
+st.markdown("Identifies **High-Probability Smart Money Concepts (SMC)** setups across Binance USDT pairs.")
+
+# Sidebar Configuration
+st.sidebar.header("Scanner Configuration")
+
+min_vol = st.sidebar.number_input(
+    "Min 24h Volume ($ USDT)", min_value=1_000_000, value=20_000_000, step=5_000_000
+)
+adx_thresh = st.sidebar.slider("HTF ADX Trend Threshold", 10, 50, 25)
+htf_tf = st.sidebar.selectbox("High Timeframe (HTF)", ["1d", "4h", "2h"], index=1)
+ltf_tf = st.sidebar.selectbox("Low Timeframe (LTF)", ["1h", "15m", "5m"], index=0)
+concurrency = st.sidebar.slider("Max Concurrent Async Requests", 1, 20, 10)
+
+if st.button("🚀 Run Market Scan", use_container_width=True):
+    scanner = HighAccuracySMCScanner(
+        min_24h_volume_usdt=float(min_vol),
+        adx_threshold=float(adx_thresh),
+        htf_interval=htf_tf,
+        ltf_interval=ltf_tf,
+    )
+
+    with st.spinner("Scanning active USDT pairs on Binance..."):
+        # Run async scan event loop inside Streamlit context
+        signals, stats = asyncio.run(scanner.run_scan(max_concurrent=concurrency))
+
+    # Display Debugging / Execution Metrics
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Pairs Checked", stats["total_pairs"])
+    col2.metric("Passed Vol Filter", stats["volume_passed"])
+    col3.metric("Passed HTF Bias", stats["htf_bias_passed"])
+    col4.metric("Valid Signals Found", len(signals))
+
+    st.markdown("---")
+
+    if signals:
+        df_results = pd.DataFrame(signals)
+        
+        # Clean & Format Output Data
+        df_results["Signal"] = df_results["direction"].apply(
+            lambda x: f"🟢 LONG" if x == "LONG" else f"🔴 SHORT"
+        )
+        
+        df_display = df_results[[
+            "symbol", "Signal", "htf_adx", "entry_price", 
+            "stop_loss", "take_profit", "risk_reward", 
+            "bos_confirmed", "liquidity_swept", "fvg_present"
+        ]].copy()
+        
+        df_display.columns = [
+            "Pair", "Direction", "HTF ADX", "Entry Price", 
+            "Stop Loss", "Take Profit", "R:R", 
+            "BOS Confirmed", "Liq Swept", "FVG Present"
+        ]
+
+        st.success(f"Found **{len(signals)}** active SMC trade opportunities!")
+        st.dataframe(
+            df_display, 
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.warning("No SMC setups found matching your current threshold criteria.")
+        
