@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =====================================================================
-# CORE SMC SCANNER ENGINE (ROBUST & RESILIENT)
+# CORE SMC SCANNER ENGINE (WITH INTEGRATED NTFY NOTIFICATIONS)
 # =====================================================================
 
 class HighAccuracySMCScanner:
@@ -24,6 +24,8 @@ class HighAccuracySMCScanner:
         htf_interval: str = "4h",
         ltf_interval: str = "1h",
         kline_limit: int = 200,
+        enable_notifications: bool = False,
+        ntfy_topic: str = "",
     ):
         # List of alternative Binance API mirrors for failover/IP bypass
         self.fallback_urls = [
@@ -39,11 +41,15 @@ class HighAccuracySMCScanner:
         self.htf_interval = htf_interval
         self.ltf_interval = ltf_interval
         self.kline_limit = kline_limit
+        self.enable_notifications = enable_notifications
+        self.ntfy_topic = ntfy_topic.strip()
+        
         self.debug_stats = {
             "total_pairs": 0,
             "volume_passed": 0,
             "htf_bias_passed": 0,
             "ltf_entry_passed": 0,
+            "notifications_sent": 0,
             "errors": 0,
         }
 
@@ -54,6 +60,43 @@ class HighAccuracySMCScanner:
     def _rotate_domain(self):
         self.current_base_idx = (self.current_base_idx + 1) % len(self.fallback_urls)
         logger.warning(f"Rotating Binance API domain to: {self.base_url}")
+
+    async def send_ntfy_alert(self, signal: dict):
+        """Dispatches real-time push notification to mobile via ntfy.sh"""
+        if not self.enable_notifications or not self.ntfy_topic:
+            return
+
+        direction_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
+        title = f"{direction_emoji} {signal['direction']} SIGNAL: {signal['symbol']}"
+
+        # Detailed trade alert formatting
+        message = (
+            f"🎯 Pair: {signal['symbol']}\n"
+            f"📊 Direction: {signal['direction']}\n"
+            f"💰 Entry Price: {signal['entry_price']}\n"
+            f"🛑 Stop Loss (SL): {signal['stop_loss']}\n"
+            f"🎯 Take Profit (TP): {signal['take_profit']}\n"
+            f"⚖️ Risk/Reward: {signal['risk_reward']}R\n"
+            f"📈 HTF ADX Strength: {signal['htf_adx']}"
+        )
+
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{self.ntfy_topic}",
+            data=message.encode("utf-8"),
+            headers={
+                "Title": title,
+                "Priority": "high",
+                "Tags": "chart_with_upwards_trend,warning" if signal["direction"] == "LONG" else "chart_with_downwards_trend,warning",
+            },
+            method="POST",
+        )
+
+        try:
+            await asyncio.to_thread(urllib.request.urlopen, req, timeout=5)
+            self.debug_stats["notifications_sent"] += 1
+            logger.info(f"Notification dispatched for {signal['symbol']} to topic '{self.ntfy_topic}'")
+        except Exception as e:
+            logger.error(f"Failed to send ntfy notification for {signal['symbol']}: {e}")
 
     @staticmethod
     def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -115,7 +158,7 @@ class HighAccuracySMCScanner:
 
         ltf_df["atr"] = self.calculate_atr(ltf_df)
         ltf_df["atr_sma"] = ltf_df["atr"].rolling(20).mean()
-        
+
         atr_expansion = ltf_df["atr"].iloc[-2] >= (ltf_df["atr_sma"].iloc[-2] * 1.15)
         atr_val = float(ltf_df["atr"].iloc[-2])
 
@@ -168,12 +211,10 @@ class HighAccuracySMCScanner:
         }
 
     async def _async_get_json(self, path: str) -> dict | list:
-        """Fetches JSON with retries, domain switching, and safe HTTP exception handling."""
         max_retries = 3
-        
         for attempt in range(max_retries):
             url = f"{self.base_url}{path}"
-            
+
             def _fetch():
                 req = urllib.request.Request(
                     url,
@@ -190,8 +231,6 @@ class HighAccuracySMCScanner:
             except urllib.error.HTTPError as e:
                 logger.warning(f"HTTP {e.code} on {url} (Attempt {attempt + 1}/{max_retries})")
                 self.debug_stats["errors"] += 1
-                
-                # Rotate domain on 451 (geoblock), 403 (forbidden), or 429 (rate limit)
                 if e.code in (403, 451, 429):
                     self._rotate_domain()
                 await asyncio.sleep(0.5 * (attempt + 1))
@@ -208,25 +247,25 @@ class HighAccuracySMCScanner:
             return []
 
         self.debug_stats["total_pairs"] = len(tickers)
-        
+
         valid_symbols = []
         for t in tickers:
             symbol = t.get("symbol", "")
             quote_vol = float(t.get("quoteVolume", 0.0))
             if (
-                symbol.endswith("USDT") 
+                symbol.endswith("USDT")
                 and not any(x in symbol for x in ["UPUSDT", "DOWNUSDT", "BEARUSDT", "BULLUSDT"])
                 and quote_vol >= self.min_24h_volume_usdt
             ):
                 valid_symbols.append(symbol)
-                
+
         self.debug_stats["volume_passed"] = len(valid_symbols)
         return valid_symbols
 
     async def fetch_klines(self, symbol: str, interval: str) -> pd.DataFrame:
         params = urllib.parse.urlencode({"symbol": symbol, "interval": interval, "limit": self.kline_limit})
         raw_klines = await self._async_get_json(f"/api/v3/klines?{params}")
-        
+
         if not raw_klines or not isinstance(raw_klines, list):
             return pd.DataFrame()
 
@@ -247,9 +286,8 @@ class HighAccuracySMCScanner:
             htf_df = await self.fetch_klines(symbol, interval=self.htf_interval)
             if htf_df.empty:
                 return None
-                
-            htf_res = self.evaluate_htf_bias(htf_df)
 
+            htf_res = self.evaluate_htf_bias(htf_df)
             if htf_res["bias"] == "NEUTRAL":
                 return None
 
@@ -263,13 +301,18 @@ class HighAccuracySMCScanner:
 
             if ltf_res["passed"]:
                 self.debug_stats["ltf_entry_passed"] += 1
-                return {
+                signal_data = {
                     "symbol": symbol,
                     "direction": ltf_res["direction"],
                     "htf_bias": htf_res["bias"],
                     "htf_adx": htf_res["adx"],
                     **ltf_res["metrics"],
                 }
+
+                # Dispatch push notification if enabled
+                await self.send_ntfy_alert(signal_data)
+
+                return signal_data
         except Exception as e:
             self.debug_stats["errors"] += 1
             logger.error(f"Error scanning {symbol}: {e}")
@@ -288,7 +331,7 @@ class HighAccuracySMCScanner:
 
         tasks = [_bounded_scan(sym) for sym in symbols]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         signals = [res for res in results if isinstance(res, dict) and res is not None]
         sorted_signals = sorted(signals, key=lambda x: x["htf_adx"], reverse=True)
         return sorted_signals, self.debug_stats
@@ -313,50 +356,63 @@ htf_tf = st.sidebar.selectbox("High Timeframe (HTF)", ["1d", "4h", "2h"], index=
 ltf_tf = st.sidebar.selectbox("Low Timeframe (LTF)", ["1h", "15m", "5m"], index=0)
 concurrency = st.sidebar.slider("Max Concurrent Async Requests", 1, 20, 10)
 
+st.sidebar.markdown("---")
+st.sidebar.header("🔔 Mobile Push Alerts (ntfy.sh)")
+enable_ntfy = st.sidebar.checkbox("Enable Push Notifications", value=True)
+ntfy_topic_input = st.sidebar.text_input(
+    "ntfy Topic Name", 
+    value="Gipsy_AI_888", 
+    help="Enter your unique ntfy topic name to subscribe in the ntfy app."
+)
+
 if st.button("🚀 Run Market Scan", use_container_width=True):
     scanner = HighAccuracySMCScanner(
         min_24h_volume_usdt=float(min_vol),
         adx_threshold=float(adx_thresh),
         htf_interval=htf_tf,
         ltf_interval=ltf_tf,
+        enable_notifications=enable_ntfy,
+        ntfy_topic=ntfy_topic_input,
     )
 
     with st.spinner("Scanning active USDT pairs on Binance..."):
-        # Run async scan event loop inside Streamlit context
         signals, stats = asyncio.run(scanner.run_scan(max_concurrent=concurrency))
 
-    # Display Debugging / Execution Metrics
-    col1, col2, col3, col4 = st.columns(4)
+    # Display Execution Metrics
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Total Pairs Checked", stats["total_pairs"])
     col2.metric("Passed Vol Filter", stats["volume_passed"])
     col3.metric("Passed HTF Bias", stats["htf_bias_passed"])
     col4.metric("Valid Signals Found", len(signals))
+    col5.metric("Alerts Dispatched", stats["notifications_sent"])
 
     st.markdown("---")
 
     if signals:
         df_results = pd.DataFrame(signals)
-        
-        # Clean & Format Output Data
+
         df_results["Signal"] = df_results["direction"].apply(
-            lambda x: f"🟢 LONG" if x == "LONG" else f"🔴 SHORT"
+            lambda x: "🟢 LONG" if x == "LONG" else "🔴 SHORT"
         )
-        
+
         df_display = df_results[[
-            "symbol", "Signal", "htf_adx", "entry_price", 
-            "stop_loss", "take_profit", "risk_reward", 
+            "symbol", "Signal", "htf_adx", "entry_price",
+            "stop_loss", "take_profit", "risk_reward",
             "bos_confirmed", "liquidity_swept", "fvg_present"
         ]].copy()
-        
+
         df_display.columns = [
-            "Pair", "Direction", "HTF ADX", "Entry Price", 
-            "Stop Loss", "Take Profit", "R:R", 
+            "Pair", "Direction", "HTF ADX", "Entry Price",
+            "Stop Loss", "Take Profit", "R:R",
             "BOS Confirmed", "Liq Swept", "FVG Present"
         ]
 
         st.success(f"Found **{len(signals)}** active SMC trade opportunities!")
+        if enable_ntfy and stats["notifications_sent"] > 0:
+            st.info(f"📲 Successfully sent **{stats['notifications_sent']}** trade alerts to ntfy topic **'{ntfy_topic_input}'**.")
+
         st.dataframe(
-            df_display, 
+            df_display,
             use_container_width=True,
             hide_index=True
         )
