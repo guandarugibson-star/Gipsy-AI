@@ -471,6 +471,16 @@ elif page == "📊 Multi-Asset Summary Dashboard":
     c1, c2 = st.columns(2)
 
     with c1:
-        fig_returns = px.bar()
+        fig_returns = px.bar(
             summary_df,
+            x="Ticker",
+            y="Expected Return (%)",
+            color="Timeline (Days)",
+            barmode="group",
+            title="Expected Return by Horizon (%)",
+            color_continuous_scale="Viridis"
+        )
+        fig_returns.update_layout(template="plotly_white", height=400)
+        st.plotly_chart(fig_returns, use_container_width=True)
+        
       
