@@ -25,12 +25,23 @@ page = st.sidebar.radio(
 # Helper Functions & Quantitative Engines
 # ---------------------------------------------------------
 def sanitize_ticker(symbol: str) -> str:
-    """Sanitizes user input tickers for yfinance compatibility."""
+    """
+    Sanitizes user input tickers for yfinance compatibility.
+    Automatically formats crypto pairs (e.g., BTC -> BTC-USD) 
+    and forex currency pairs (e.g., EURUSD -> EURUSD=X).
+    """
     symbol = symbol.strip().upper()
+    
+    # Handle Crypto shortcuts
     crypto_bases = ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "BNB", "AVAX", "DOT", "LINK"]
     for coin in crypto_bases:
         if symbol.startswith(coin) and ("USD" in symbol or "=X" in symbol or "/" in symbol):
             return f"{coin}-USD"
+            
+    # Handle Forex pairs entered cleanly like EURUSD, GBPUSD, USDJPY, AUDUSD, etc.
+    if len(symbol) == 6 and symbol.isalpha() and not "=" in symbol and not "-" in symbol:
+        return f"{symbol}=X"
+        
     return symbol
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -154,24 +165,20 @@ def calculate_optimal_trade_levels(sim_matrix, S0, atr_14):
     Scans Monte Carlo simulation paths using MFE/MAE (Maximum Favorable / Adverse Excursion) 
     to automatically derive mathematically sound entry, stop-loss, and take-profit targets.
     """
-    # 1. Optimal Entry: Pullback to support (25th percentile of simulated path lows, bounded by ATR)
     path_minima = np.min(sim_matrix, axis=0)
     median_path_dip = np.percentile(path_minima, 25)
     optimal_entry = max(S0 - (0.5 * atr_14), median_path_dip)
-    optimal_entry = min(optimal_entry, S0)  # Never above spot price for a standard long setup
+    optimal_entry = min(optimal_entry, S0)
 
-    # 2. Stop Loss: Set dynamically beneath the 5th percentile extreme downside (MAE floor)
     p5_downside = np.percentile(sim_matrix[-1, :], 5)
     stop_loss = max(optimal_entry - (1.5 * atr_14), p5_downside)
     if stop_loss >= optimal_entry:
         stop_loss = optimal_entry * 0.98
 
-    # 3. Take Profits: Derived from MFE (Maximum Favorable Excursion) path extremes
     path_maxima = np.max(sim_matrix, axis=0)
     tp_1 = float(np.percentile(path_maxima, 60))
     tp_2 = float(np.percentile(path_maxima, 85))
 
-    # Guardrails to preserve target hierarchies
     tp_1 = max(tp_1, optimal_entry + (1.5 * atr_14))
     tp_2 = max(tp_2, optimal_entry + (3.0 * atr_14))
 
@@ -189,7 +196,6 @@ if page == "📖 Beginner's Guide & Single Simulator":
     st.title("📈 Gipsy Trading AI")
     st.caption("Quantitative risk estimation and dynamic MFE/MAE trade targeting across intraday & daily intervals.")
     
-    # --- Live Data Feed Controls ---
     st.sidebar.header("⚡ Live Data Feed Settings")
     auto_refresh_active = st.sidebar.toggle("Enable Live Auto-Refresh", value=True)
     refresh_rate_sec = st.sidebar.slider("Refresh Interval (Seconds)", 2, 30, 3, step=1)
@@ -197,20 +203,17 @@ if page == "📖 Beginner's Guide & Single Simulator":
     if st.sidebar.button("🔄 Force Refresh All Data"):
         st.cache_data.clear()
 
-    # --- Beginner Accordion ---
     with st.expander("📖 Guide to MFE/MAE Quantitative Optimization", expanded=False):
         st.markdown("""
         ### 🧠 How Trade Targets Are Optimized Here
-        Instead of guessing percentages, this app runs thousands of random paths and measures:
-        * **MAE (Maximum Adverse Excursion):** Where price bottoms out on worst-case paths to calculate tight, whipsaw-resistant **Stop Losses**.
-        * **MFE (Maximum Favorable Excursion):** Where price peaks on high-upside paths to extract optimal **Take Profit (TP1 & TP2)** boundaries.
+        * **MAE (Maximum Adverse Excursion):** Bottoms out worst-case paths to build tight **Stop Losses**.
+        * **MFE (Maximum Favorable Excursion):** Peaks high-upside paths to extract optimal **Take Profits**.
         """)
 
     st.markdown("---")
 
-    # Controls
     st.sidebar.header("🛠️ Simulation Setup")
-    user_ticker_input = st.sidebar.text_input("Asset Ticker Symbol", value="BTC-USD")
+    user_ticker_input = st.sidebar.text_input("Asset Ticker Symbol (e.g. EURUSD, BTC-USD, AAPL)", value="EURUSD")
     ticker = sanitize_ticker(user_ticker_input)
 
     candle_interval = st.sidebar.selectbox("Candle Timeframe Interval", ["15m", "1h", "4h", "1d"], index=1)
@@ -228,28 +231,22 @@ if page == "📖 Beginner's Guide & Single Simulator":
 
     jump_params = None
     if model_type == "Jump-Diffusion (Merton)":
-        j_lambda = 4.0 / 252.0
-        j_mu = -0.05
-        j_sigma = 0.05
-        jump_params = (j_lambda, j_mu, j_sigma)
+        jump_params = (4.0 / 252.0, -0.05, 0.05)
 
-    # Fetch Baseline Data
     close_data, log_returns, atr_14 = get_historical_baseline(ticker, candle_interval)
 
     if close_data is None:
-        st.error(f"❌ Could not load price data for **{ticker}** on interval **{candle_interval}**. Check ticker availability.")
+        st.error(f"❌ Could not load price data for **{ticker}** on interval **{candle_interval}**.")
         st.stop()
 
     mu = float(log_returns.mean())
     sigma = float(log_returns.std())
     fallback_last_price = float(close_data.iloc[-1])
 
-    # ---------------------------------------------------------
-    # ULTRA-FAST SMOOTH FRAGMENT
-    # ---------------------------------------------------------
     @st.fragment(run_every=refresh_rate_sec if auto_refresh_active else None)
     def render_live_simulator_dashboard():
         S0 = get_live_quote_fast(ticker, fallback_price=fallback_last_price)
+        # Forex pairs and low-value crypto usually require 4 to 5 decimal places for clarity
         decimals = 4 if S0 < 10 else 2
 
         sim_matrix = run_monte_carlo_fast(
@@ -258,7 +255,6 @@ if page == "📖 Beginner's Guide & Single Simulator":
             log_returns=log_returns, jump_params=jump_params
         )
 
-        # Quantitative MFE/MAE Optimization Call
         optimal_entry, stop_loss, tp_1, tp_2, rr_ratio = calculate_optimal_trade_levels(
             sim_matrix, S0, atr_14
         )
@@ -268,13 +264,13 @@ if page == "📖 Beginner's Guide & Single Simulator":
         p95 = np.percentile(sim_matrix, 95, axis=1)
         p5 = np.percentile(sim_matrix, 5, axis=1)
 
-        st.caption(f"🟢 **Live Data Stream Active ({candle_interval}):** `${S0:,.{decimals}f}` | Last Checked: `{pd.Timestamp.now().strftime('%H:%M:%S UTC')}`")
+        st.caption(f"🟢 **Live Data Stream Active ({candle_interval}):** `{S0:,.{decimals}f}` | Last Checked: `{pd.Timestamp.now().strftime('%H:%M:%S UTC')}`")
         st.markdown("### 🚦 Automated MFE/MAE Trade Snapshot")
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("1. Live Spot Price", f"${S0:.{decimals}f}")
-        col2.metric("2. Optimized Limit Entry", f"${optimal_entry:.{decimals}f}")
-        col3.metric("3. Optimized Target (TP1)", f"${tp_1:.{decimals}f}", delta=f"+{((tp_1/optimal_entry)-1)*100:.1f}%")
-        col4.metric("4. Optimized Stop Loss", f"${stop_loss:.{decimals}f}", delta=f"{((stop_loss/optimal_entry)-1)*100:.1f}%", delta_color="inverse")
+        col1.metric("1. Live Spot Price", f"{S0:,.{decimals}f}")
+        col2.metric("2. Optimized Limit Entry", f"{optimal_entry:,.{decimals}f}")
+        col3.metric("3. Optimized Target (TP1)", f"{tp_1:,.{decimals}f}", delta=f"+{((tp_1/optimal_entry)-1)*100:.2f}%")
+        col4.metric("4. Optimized Stop Loss", f"{stop_loss:,.{decimals}f}", delta=f"{((stop_loss/optimal_entry)-1)*100:.2f}%", delta_color="inverse")
 
         st.markdown("---")
         col_left, col_right = st.columns([2, 1])
@@ -282,11 +278,11 @@ if page == "📖 Beginner's Guide & Single Simulator":
             st.subheader("🎯 Strategy Breakdown")
             st.markdown(f"""
             * **Asset / Timeframe:** `{ticker}` @ `{candle_interval}`
-            * **Bar Noise (14-Bar ATR):** `${atr_14:.{decimals}f}`
-            * **Quantitative Limit Entry:** **`${optimal_entry:.{decimals}f}`**
-            * **MFE Target 1 (TP1):** **`${tp_1:.{decimals}f}`**
-            * **MFE Target 2 (TP2):** **`${tp_2:.{decimals}f}`**
-            * **MAE Stop Loss Boundary:** **`${stop_loss:.{decimals}f}`**
+            * **Bar Noise (14-Bar ATR):** `{atr_14:,.{decimals}f}`
+            * **Quantitative Limit Entry:** **`{optimal_entry:,.{decimals}f}`**
+            * **MFE Target 1 (TP1):** **`{tp_1:,.{decimals}f}`**
+            * **MFE Target 2 (TP2):** **`{tp_2:,.{decimals}f}`**
+            * **MAE Stop Loss Boundary:** **`{stop_loss:,.{decimals}f}`**
             """)
 
         with col_right:
@@ -299,7 +295,6 @@ if page == "📖 Beginner's Guide & Single Simulator":
             else:
                 st.error("🔴 **Low R:R Ratio** — Exercise caution.")
 
-        # Interactive Chart
         st.markdown("---")
         st.subheader(f"📊 Projected Path Cone & Optimal Levels ({forecast_steps} Steps @ {candle_interval})")
 
@@ -341,7 +336,7 @@ if page == "📖 Beginner's Guide & Single Simulator":
 
         fig.update_layout(
             xaxis_title=f"Candle Steps ({candle_interval})",
-            yaxis_title="Price ($)",
+            yaxis_title="Price / Exchange Rate",
             template="plotly_white",
             height=500,
             margin=dict(l=20, r=20, t=30, b=20)
@@ -353,14 +348,17 @@ if page == "📖 Beginner's Guide & Single Simulator":
 
 
 # =========================================================
-# PAGE 2: MULTI-ASSET DASHBOARD WITH CONCURRENT FETCH
+# PAGE 2: MULTI-ASSET DASHBOARD WITH 12 ASSETS CONCURRENT FETCH
 # =========================================================
 elif page == "📊 Multi-Asset Summary Dashboard":
     st.title("📊 Multi-Asset & Multi-Interval Summary Dashboard")
-    st.caption("Concurrent MFE/MAE risk and target analysis across asset pools.")
+    st.caption("Concurrent MFE/MAE risk and target analysis across a multi-asset watch list including forex currencies.")
 
     st.sidebar.header("⚙️ Dashboard Controls")
-    default_tickers_text = st.sidebar.text_area("Assets to Compare", value="BTC-USD, ETH-USD, AAPL, MSFT")
+    
+    # Pre-loaded with 12 distinct assets now natively featuring major forex crosses (EURUSD, GBPUSD, USDJPY) alongside crypto and stocks
+    default_12_assets = "EURUSD, GBPUSD, USDJPY, BTC-USD, ETH-USD, SOL-USD, AAPL, MSFT, NVDA, AMZN, GC=F, CL=F"
+    default_tickers_text = st.sidebar.text_area("Assets to Compare (Comma-separated)", value=default_12_assets, height=100)
     
     selected_interval = st.sidebar.selectbox("Comparison Interval", ["15m", "1h", "4h", "1d"], index=1)
     selected_steps_list = st.sidebar.multiselect("Forecast Steps Ahead", options=[10, 20, 30, 50, 100], default=[20, 50])
@@ -381,7 +379,7 @@ elif page == "📊 Multi-Asset Summary Dashboard":
             S0 = get_live_quote_fast(t_symbol, fallback_price=float(close_data.iloc[-1]))
             return (t_symbol, close_data, log_returns, atr_14, S0)
 
-        with ThreadPoolExecutor(max_workers=min(10, len(ticker_list))) as executor:
+        with ThreadPoolExecutor(max_workers=min(12, len(ticker_list))) as executor:
             data_results = list(executor.map(process_ticker, ticker_list))
 
         for res in data_results:
@@ -402,14 +400,16 @@ elif page == "📊 Multi-Asset Summary Dashboard":
                 p5_val = float(np.percentile(final_prices, 5))
                 var_5_pct = ((p5_val / S0) - 1) * 100
 
+                decimals = 4 if S0 < 10 else 2
+
                 summary_rows.append({
                     "Ticker": t_symbol,
                     "Interval": selected_interval,
-                    "Live Price ($)": round(S0, 4 if S0 < 10 else 2),
+                    "Live Price": round(S0, decimals),
                     "Steps": steps,
-                    "Limit Entry ($)": round(optimal_entry, 4 if S0 < 10 else 2),
-                    "Stop Loss ($)": round(stop_loss, 4 if S0 < 10 else 2),
-                    "Take Profit 1 ($)": round(tp_1, 4 if S0 < 10 else 2),
+                    "Limit Entry": round(optimal_entry, decimals),
+                    "Stop Loss": round(stop_loss, decimals),
+                    "Take Profit 1": round(tp_1, decimals),
                     "R:R Ratio": round(rr_ratio, 2),
                     "Exp Return (%)": round(exp_return_pct, 2)
                 })
@@ -434,6 +434,6 @@ elif page == "📊 Multi-Asset Summary Dashboard":
     st.download_button(
         label="📥 Download Matrix as CSV",
         data=csv_data,
-        file_name="gipsy_optimized_trading_matrix.csv",
+        file_name="gipsy_currency_asset_trading_matrix.csv",
         mime="text/csv"
     )
