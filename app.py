@@ -10,7 +10,7 @@ import plotly.express as px
 # Page Configuration & Navigation
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="Monte Carlo Risk & Trade Suite",
+    page_title="Gipsy Trading AI",
     page_icon="📈",
     layout="wide"
 )
@@ -101,16 +101,17 @@ def run_monte_carlo(S0: float, mu: float, sigma: float, days: int, n_sims: int =
 # PAGE 1: BEGINNER GUIDE & SINGLE SIMULATOR
 # =========================================================
 if page == "📖 Beginner's Guide & Single Simulator":
-    st.title("📈 Monte Carlo Risk & Trade Level Simulator")
+    st.title("📈 Gipsy Trading AI")
+    st.caption("Quantitative risk estimation & optimal trade targets for stocks, forex, and crypto.")
     
     # --- Beginner-Friendly Guide Accordion ---
     with st.expander("📖 New to Trading & Risk Modeling? Click here for the Beginner's Guide", expanded=False):
         st.markdown("""
-        ### 👋 Welcome to the Monte Carlo Simulator!
+        ### 👋 Welcome to Gipsy Trading AI!
         This tool uses mathematical statistical models to project thousands of potential future price paths for any asset. Here is how to read and use the dashboard:
 
-        #### 1. How Monte Carlo Works
-        Instead of predicting a single "exact price," Monte Carlo simulation generates thousands of random daily price movements based on an asset's **historical volatility** and **average daily drift**.
+        #### 1. How Gipsy Trading AI Models Prices
+        Instead of predicting a single "exact price," Gipsy Trading AI generates thousands of random daily price movements based on an asset's **historical volatility** and **average daily drift**.
         * **Median Path:** Represents the central expected outcome (50th percentile).
         * **Outer Lines:** Represent extreme upside and downside conditions.
 
@@ -381,7 +382,6 @@ elif page == "📊 Multi-Asset Summary Dashboard":
             ann_vol = sigma * np.sqrt(252) * 100
 
             for days in selected_timelines:
-                # 1,000 simulations per combo
                 sim_matrix = run_monte_carlo(S0, mu, sigma, days, n_sims=1000)
                 final_prices = sim_matrix[-1, :]
 
@@ -423,7 +423,6 @@ elif page == "📊 Multi-Asset Summary Dashboard":
     # --- Section 1: Summary Table ---
     st.subheader("📋 Comprehensive Asset & Horizon Matrix")
     
-    # Filter Controls
     col_f1, col_f2 = st.columns(2)
     filter_ticker = col_f1.multiselect("Filter by Ticker", options=summary_df["Ticker"].unique(), default=summary_df["Ticker"].unique())
     filter_timeline = col_f2.multiselect("Filter by Timeline", options=summary_df["Timeline (Days)"].unique(), default=summary_df["Timeline (Days)"].unique())
@@ -475,4 +474,4 @@ elif page == "📊 Multi-Asset Summary Dashboard":
         fig_var.update_layout(height=400)
         st.plotly_chart(fig_var, use_container_width=True)
 
-    
+    st.sub
