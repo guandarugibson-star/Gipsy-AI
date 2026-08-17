@@ -23,8 +23,8 @@ st.caption("Quantitative risk estimation and optimal Entry / Take Profit / Stop 
 with st.expander("❓ How are Entry, TP, and SL calculated?"):
     st.markdown("""
     * **Optimal Entry:** Calculated using Average True Range (ATR) to identify optimal pullback/retest levels instead of chasing the current market price.
-    * **Take Profit (TP1 & TP2):** Set at the **68th percentile** (conservative) and **80th percentile** (aggressive) upside targets from the Monte Carlo paths.
-    * **Stop Loss (SL):** Positioned below the **ATR market noise buffer** and aligned with the **5th percentile VaR downside limit** to protect capital without tight stop-outs.
+    * **Take Profit (TP1 & TP2):** Set at the **68th percentile** (conservative) and **80th percentile** (extended) targets from the Monte Carlo simulated paths.
+    * **Stop Loss (SL):** Positioned below the **ATR market noise buffer** and aligned with the **5th percentile VaR downside limit** to protect capital without getting stopped out by random market noise.
     * **Risk-to-Reward (R:R):** Automatically calculated based on TP1 vs. SL distance. Look for a ratio of **1:1.5 or better**.
     """)
 
@@ -92,6 +92,10 @@ S0 = float(close_data.iloc[-1])
 mu = float(log_returns.mean())
 sigma = float(log_returns.std())
 annualized_vol = sigma * np.sqrt(252)
+
+# Dynamic precision helper based on price scale
+decimals = 4 if S0 < 10 else 2
+fmt = f":.{decimals}f"
 
 # ---------------------------------------------------------
 # Model Selection Logic
@@ -170,13 +174,14 @@ elif model_type == "Jump-Diffusion (Merton)":
 # ---------------------------------------------------------
 final_prices = sim_matrix[-1, :]
 p5_var = np.percentile(final_prices, 5)
-p50_median = np.percentile(final_prices, 50)
 p68_tp1 = np.percentile(final_prices, 68)
 p80_tp2 = np.percentile(final_prices, 80)
 
-# Optimal Retest / Entry Level (Current Price - 0.5 * ATR or near current market)
+# Optimal Limit Entry (Pullback or Retest Buffer using ATR)
 optimal_entry = max(S0 - (0.5 * atr_14), S0 * 0.995)
-stop_loss = min(p5_var, optimal_entry - (1.5 * atr_14))
+
+# Calculate SL using 1.0x ATR to give room without over-extending risk distance
+stop_loss = max(optimal_entry - (1.0 * atr_14), p5_var)
 tp_1 = max(p68_tp1, optimal_entry + (1.5 * atr_14))
 tp_2 = max(p80_tp2, optimal_entry + (3.0 * atr_14))
 
@@ -189,10 +194,10 @@ rr_ratio = reward_per_unit / risk_per_unit if risk_per_unit > 0 else 0.0
 # Main Page Dashboard Metrics
 # ---------------------------------------------------------
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-col_m1.metric("Current Market Price", f"${S0:.4f}" if S0 < 10 else f"${S0:.2f}")
-col_m2.metric("Optimal Limit Entry", f"${optimal_entry:.4f}" if S0 < 10 else f"${optimal_entry:.2f}", help="Pullback level factoring ATR volatility.")
-col_m3.metric("Take Profit 1 (Conservative)", f"${tp_1:.4f}" if S0 < 10 else f"${tp_1:.2f}", delta=f"+{((tp_1/optimal_entry)-1)*100:.1f}%")
-col_m4.metric("Stop Loss (SL)", f"${stop_loss:.4f}" if S0 < 10 else f"${stop_loss:.2f}", delta=f"{((stop_loss/optimal_entry)-1)*100:.1f}%", delta_color="inverse")
+col_m1.metric("Current Market Price", f"${S0:{fmt}}")
+col_m2.metric("Optimal Limit Entry", f"${optimal_entry:{fmt}}", help="Pullback level factoring ATR volatility.")
+col_m3.metric("Take Profit 1 (Conservative)", f"${tp_1:{fmt}}", delta=f"+{((tp_1/optimal_entry)-1)*100:.1f}%")
+col_m4.metric("Stop Loss (SL)", f"${stop_loss:{fmt}}", delta=f"{((stop_loss/optimal_entry)-1)*100:.1f}%", delta_color="inverse")
 
 st.markdown("---")
 
@@ -204,18 +209,18 @@ col_strat, col_rr = st.columns([3, 1])
 with col_strat:
     st.subheader("🎯 Trade Execution Card")
     st.markdown(f"""
-    * **Asset:** `{ticker}` | **14-Day ATR Volatility Buffer:** `${atr_14:.4f}`
-    * **Optimal Entry Zone:** Buy Limit at **`${optimal_entry:.4f}`** *(Wait for key intraday dip/retest)*
-    * **Take Profit 1 (TP1):** **`${tp_1:.4f}`** *(68th percentile distribution target)*
-    * **Take Profit 2 (TP2 - Extended):** **`${tp_2:.4f}`** *(80th percentile distribution target)*
-    * **Stop Loss (SL):** **`${stop_loss:.4f}`** *(Placed below 1.5x ATR noise buffer & 95% VaR floor)*
+    * **Asset:** `{ticker}` | **14-Day ATR Volatility Buffer:** `${atr_14:{fmt}}`
+    * **Optimal Entry Zone:** Buy Limit at **`${optimal_entry:{fmt}}`** *(Wait for key intraday dip/retest)*
+    * **Take Profit 1 (TP1):** **`${tp_1:{fmt}}`** *(68th percentile distribution target)*
+    * **Take Profit 2 (TP2 - Extended):** **`${tp_2:{fmt}}`** *(80th percentile distribution target)*
+    * **Stop Loss (SL):** **`${stop_loss:{fmt}}`** *(Placed below 1.0x ATR noise buffer & VaR threshold)*
     """)
 
 with col_rr:
     st.subheader("⚖️ Risk : Reward")
     st.metric("R:R Ratio (TP1 / SL)", f"1 : {rr_ratio:.2f}")
     if rr_ratio >= 1.5:
-        st.success("✅ Excellent Trade Setup (R:R > 1:1.5)")
+        st.success("✅ Excellent Trade Setup (R:R >= 1:1.5)")
     elif rr_ratio >= 1.0:
         st.warning("⚠️ Moderate Setup (R:R 1:1.0)")
     else:
@@ -229,7 +234,7 @@ st.subheader("📊 Price Path Projections & Key Trade Levels")
 
 fig = go.Figure()
 
-# Plot path lines
+# Plot simulation path lines
 display_paths = min(80, n_simulations)
 for i in range(display_paths):
     fig.add_trace(go.Scatter(
@@ -245,14 +250,14 @@ fig.add_trace(go.Scatter(
     y=np.median(sim_matrix, axis=1),
     mode='lines',
     name='Median Path',
-    line=dict(color='gold', width=2.5)
+    line=dict(color='#EAB308', width=2.5)  # Gold/Yellow Hex Code
 ))
 
-# Add Horizontal Trade Level Markers
-fig.add_hline(y=optimal_entry, line_dash="dash", line_color="blue", annotation_text="Optimal Entry", annotation_position="bottom right")
-fig.add_hline(y=tp_1, line_dash="dash", line_color="green", annotation_text="TP 1 (Conservative)", annotation_position="top right")
-fig.add_hline(y=tp_2, line_dash="dot", line_color="emerald", annotation_text="TP 2 (Aggressive)", annotation_position="top right")
-fig.add_hline(y=stop_loss, line_dash="dash", line_color="red", annotation_text="Stop Loss (SL)", annotation_position="bottom right")
+# Add Horizontal Trade Level Markers using explicit Hex Colors
+fig.add_hline(y=optimal_entry, line_dash="dash", line_color="#3B82F6", annotation_text="Optimal Entry", annotation_position="bottom right")
+fig.add_hline(y=tp_1, line_dash="dash", line_color="#10B981", annotation_text="TP 1 (Conservative)", annotation_position="top right")
+fig.add_hline(y=tp_2, line_dash="dot", line_color="#059669", annotation_text="TP 2 (Aggressive)", annotation_position="top right")
+fig.add_hline(y=stop_loss, line_dash="dash", line_color="#EF4444", annotation_text="Stop Loss (SL)", annotation_position="bottom right")
 
 fig.update_layout(
     xaxis_title="Trading Days Ahead",
