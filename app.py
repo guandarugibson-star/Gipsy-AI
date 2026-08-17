@@ -69,6 +69,7 @@ def get_historical_baseline(symbol: str):
         atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
         
         returns = np.log(close / close_prev).dropna()
+        last_close = float(close.iloc[-1])
 
         return close, returns, atr
     except Exception:
@@ -298,9 +299,9 @@ if page == "📖 Beginner's Guide & Single Simulator":
 
         # Position Size Calculator
         with st.expander("🧮 Position Size Calculator"):
-            c1_pos, c2_pos = st.columns(2)
-            account_size = c1_pos.number_input("Account Balance ($)", value=10000, step=1000)
-            risk_pct = c2_pos.slider("Risk Per Trade (%)", 0.5, 5.0, 1.0, step=0.5)
+            c1, c2 = st.columns(2)
+            account_size = c1.number_input("Account Balance ($)", value=10000, step=1000)
+            risk_pct = c2.slider("Risk Per Trade (%)", 0.5, 5.0, 1.0, step=0.5)
             
             max_risk_dollars = account_size * (risk_pct / 100.0)
             risk_per_share = optimal_entry - stop_loss
@@ -472,5 +473,4 @@ elif page == "📊 Multi-Asset Summary Dashboard":
     with c1:
         fig_returns = px.bar(
             summary_df,
-            x="Ticker",
-         
+      
