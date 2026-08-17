@@ -138,8 +138,8 @@ S0 = float(close_data.iloc[-1])
 mu = float(log_returns.mean())
 sigma = float(log_returns.std())
 
+# Number of decimal places based on price scale
 decimals = 4 if S0 < 10 else 2
-fmt = f":.{decimals}f"
 
 # ---------------------------------------------------------
 # Simulation Engine
@@ -198,10 +198,10 @@ rr_ratio = reward_per_unit / risk_per_unit if risk_per_unit > 0 else 0.0
 st.markdown("### 🚦 Trade Snapshot")
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("1. Current Price", f"${S0:{fmt}}")
-col2.metric("2. Limit Entry Target", f"${optimal_entry:{fmt}}", help="Suggested entry price to wait for a dip.")
-col3.metric("3. Conservative TP1", f"${tp_1:{fmt}}", delta=f"+{((tp_1/optimal_entry)-1)*100:.1f}%")
-col4.metric("4. Protection Stop Loss", f"${stop_loss:{fmt}}", delta=f"{((stop_loss/optimal_entry)-1)*100:.1f}%", delta_color="inverse")
+col1.metric("1. Current Price", f"${S0:.{decimals}f}")
+col2.metric("2. Limit Entry Target", f"${optimal_entry:.{decimals}f}", help="Suggested entry price to wait for a dip.")
+col3.metric("3. Conservative TP1", f"${tp_1:.{decimals}f}", delta=f"+{((tp_1/optimal_entry)-1)*100:.1f}%")
+col4.metric("4. Protection Stop Loss", f"${stop_loss:.{decimals}f}", delta=f"{((stop_loss/optimal_entry)-1)*100:.1f}%", delta_color="inverse")
 
 st.markdown("---")
 
@@ -214,11 +214,11 @@ with col_left:
     st.subheader("🎯 Trade Plan Breakdown")
     st.markdown(f"""
     * **Asset:** `{ticker}`
-    * **Daily Volatility Noise Buffer (14-Day ATR):** `${atr_14:{fmt}}`
-    * **Optimal Buy Level:** Place a Limit Order at **`${optimal_entry:{fmt}}`** *(Avoid buying at current peak)*
-    * **Take Profit Target (TP1):** **`${tp_1:{fmt}}`**
-    * **Extended Profit Target (TP2):** **`${tp_2:{fmt}}`**
-    * **Stop Loss Boundary:** **`${stop_loss:{fmt}}`**
+    * **Daily Volatility Noise Buffer (14-Day ATR):** `${atr_14:.{decimals}f}`
+    * **Optimal Buy Level:** Place a Limit Order at **`${optimal_entry:.{decimals}f}`** *(Avoid buying at current peak)*
+    * **Take Profit Target (TP1):** **`${tp_1:.{decimals}f}`**
+    * **Extended Profit Target (TP2):** **`${tp_2:.{decimals}f}`**
+    * **Stop Loss Boundary:** **`${stop_loss:.{decimals}f}`**
     """)
 
 with col_right:
@@ -291,4 +291,3 @@ fig.update_layout(
 )
 
 st.plotly_chart(fig, use_container_width=True)
-        
