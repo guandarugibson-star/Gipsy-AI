@@ -24,12 +24,26 @@ page = st.sidebar.radio(
 # Shared Helper Functions
 # ---------------------------------------------------------
 def sanitize_ticker(symbol: str) -> str:
-    """Sanitizes user input tickers for yfinance compatibility."""
-    symbol = symbol.strip().upper()
-    crypto_bases = ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "BNB", "AVAX", "DOT", "LINK"]
+    """Sanitizes user input tickers for yfinance compatibility across Forex, Crypto, Stocks & Commodities."""
+    symbol = symbol.strip().upper().replace("/", "").replace(" ", "")
+    
+    # Major Fiat Currency Pairs (Forex) -> Needs '=X' suffix in Yahoo Finance
+    forex_pairs = [
+        "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", 
+        "USDCHF", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY"
+    ]
+    if symbol in forex_pairs:
+        return f"{symbol}=X"
+    if symbol.endswith("=X"):
+        return symbol
+
+    # Major Crypto Pairs -> Needs '-USD' format
+    crypto_bases = ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "BNB", "AVAX", "DOT", "LINK", "LTC"]
     for coin in crypto_bases:
-        if symbol.startswith(coin) and ("USD" in symbol or "=X" in symbol or "/" in symbol):
-            return f"{coin}-USD"
+        if symbol.startswith(coin):
+            if "USD" in symbol or symbol == coin:
+                return f"{coin}-USD"
+
     return symbol
 
 @st.cache_data(ttl=3600)
@@ -123,7 +137,7 @@ if page == "📖 Beginner's Guide & Single Simulator":
         * **Risk-to-Reward Ratio (R:R):** Compares how much money you risk against how much you stand to gain. Aim for **1 : 1.5 or better**.
 
         #### 3. Quick-Start Steps
-        1. Choose an **Asset Ticker** in the sidebar (e.g., `AAPL`, `BTC-USD`, `EURUSD=X`).
+        1. Choose an **Asset Ticker** in the sidebar (e.g., `BTCUSD`, `EURUSD`, `AAPL`, `NVDA`, `GC=F`).
         2. Pick a **Risk Strategy Preset** that fits your personal comfort level.
         3. Review the **Trade Snapshot** cards for your entry, target, and exit levels.
         4. Use the **Position Size Calculator** to determine how many units/shares to purchase safely.
@@ -145,13 +159,13 @@ if page == "📖 Beginner's Guide & Single Simulator":
 
     user_ticker_input = st.sidebar.text_input(
         "Asset Ticker Symbol",
-        value="EURUSD=X",
-        help="Enter symbols like EURUSD=X (Forex), AAPL (Stocks), or BTC-USD / BTCUSD=X (Crypto)."
+        value="BTCUSD",
+        help="Enter symbols like BTCUSD / ETHUSD (Crypto), EURUSD / GBPUSD (Forex), AAPL / NVDA / TSLA (Stocks), or GC=F / CL=F (Commodities)."
     )
 
     ticker = sanitize_ticker(user_ticker_input)
     if ticker != user_ticker_input.strip().upper():
-        st.sidebar.info(f"💡 Auto-corrected ticker to **{ticker}** for yfinance compatibility.")
+        st.sidebar.info(f"💡 Auto-corrected ticker to **{ticker}** for data compatibility.")
 
     forecast_days = st.sidebar.slider(
         "Forecast Horizon (Days)",
@@ -180,10 +194,10 @@ if page == "📖 Beginner's Guide & Single Simulator":
 
         asset_profile = st.sidebar.selectbox(
             "Market Category",
-            ["Forex / Low Volatility", "Major Stocks / ETFs", "Crypto / High Volatility"]
+            ["Crypto / High Volatility", "Forex / Low Volatility", "Major Stocks / ETFs", "Commodities / Futures"]
         )
         
-        model_type = "Fat-Tail (Student's t)" if "Crypto" in asset_profile else "Standard (Normal Distribution)"
+        model_type = "Fat-Tail (Student's t)" if ("Crypto" in asset_profile or "Commodities" in asset_profile) else "Standard (Normal Distribution)"
         n_simulations = 1000
         jump_params = None
 
@@ -213,7 +227,7 @@ if page == "📖 Beginner's Guide & Single Simulator":
     close_data, log_returns, atr_14 = load_market_data(ticker)
 
     if close_data is None or log_returns.empty:
-        st.error(f"❌ Could not load price data for **{ticker}**. Please check the symbol (e.g., EURUSD=X, AAPL, BTC-USD).")
+        st.error(f"❌ Could not load price data for **{ticker}**. Please check the symbol (e.g., BTCUSD, EURUSD, AAPL, GC=F).")
         st.stop()
 
     S0 = float(close_data.iloc[-1])
@@ -345,11 +359,11 @@ elif page == "📊 Multi-Asset Summary Dashboard":
 
     st.sidebar.header("⚙️ Dashboard Settings")
     
-    # Preset Basket Selection
+    # Preset Basket Selection (Includes Crypto, Forex, Stocks & Commodities)
     default_tickers_text = st.sidebar.text_area(
         "Assets to Compare (Comma-Separated)",
-        value="AAPL, MSFT, BTC-USD, ETH-USD, EURUSD=X",
-        help="Enter valid Yahoo Finance tickers separated by commas."
+        value="BTCUSD, ETHUSD, SOLUSD, EURUSD, GBPUSD, USDJPY, AAPL, NVDA, TSLA, GC=F, CL=F",
+        help="Enter ticker symbols separated by commas. Includes Crypto (BTCUSD), Forex (EURUSD), Stocks (AAPL), & Commodities (GC=F)."
     )
     
     selected_timelines = st.sidebar.multiselect(
@@ -451,27 +465,4 @@ elif page == "📊 Multi-Asset Summary Dashboard":
         fig_ret = px.bar(
             filtered_df,
             x="Ticker",
-            y="Expected Return (%)",
-            color="Timeline (Days)",
-            barmode="group",
-            text_auto=".1f",
-            template="plotly_white"
-        )
-        fig_ret.update_layout(height=400)
-        st.plotly_chart(fig_ret, use_container_width=True)
-
-    with chart_col2:
-        st.markdown("##### Downside Value at Risk (5th Percentile Drop %)")
-        fig_var = px.bar(
-            filtered_df,
-            x="Ticker",
-            y="5% VaR / Downside Risk (%)",
-            color="Timeline (Days)",
-            barmode="group",
-            text_auto=".1f",
-            template="plotly_white"
-        )
-        fig_var.update_layout(height=400)
-        st.plotly_chart(fig_var, use_container_width=True)
-
-    st.sub
+            y="
