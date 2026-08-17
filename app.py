@@ -22,7 +22,7 @@ page = st.sidebar.radio(
 )
 
 # ---------------------------------------------------------
-# Helper Functions & Optimized Live Engine
+# Helper Functions & Optimized Intraday Engine
 # ---------------------------------------------------------
 def sanitize_ticker(symbol: str) -> str:
     """Sanitizes user input tickers for yfinance compatibility."""
@@ -33,15 +33,26 @@ def sanitize_ticker(symbol: str) -> str:
             return f"{coin}-USD"
     return symbol
 
-@st.cache_data(ttl=600, show_spinner=False)
-def get_historical_baseline(symbol: str):
+@st.cache_data(ttl=300, show_spinner=False)
+def get_historical_baseline(symbol: str, interval: str):
     """
-    Heavy Network Call: Cached for 10 minutes (600s).
-    Fetches 1-year daily data for ATR, log returns, and distribution stats.
+    Fetches historical data matching the requested interval.
+    Adjusts lookback periods based on yfinance limits for intraday data.
     """
     try:
+        # yfinance limits intraday data (e.g., 15m max ~60 days, 1h max ~730 days)
+        period_map = {
+            "15m": "59d",
+            "1h": "730d",
+            "4h": "730d",  # yfinance doesn't natively support '4h', we resample from '1h'
+            "1d": "1y"
+        }
+        fetch_period = period_map.get(interval, "1y")
+        fetch_interval = "1h" if interval == "4h" else interval
+
         tk = yf.Ticker(symbol)
-        df_hist = tk.history(period="1y")
+        df_hist = tk.history(period=fetch_period, interval=fetch_interval)
+        
         if df_hist.empty:
             return None, None, None
             
@@ -52,6 +63,16 @@ def get_historical_baseline(symbol: str):
 
         if 'Close' not in df_hist.columns or 'High' not in df_hist.columns or 'Low' not in df_hist.columns:
             return None, None, None
+
+        # Resample 1h data into 4h blocks if 4h was requested
+        if interval == "4h":
+            df_hist = df_hist.resample('4h').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            }).dropna()
 
         close = df_hist['Close'].dropna().astype(float)
         high = df_hist['High'].dropna().astype(float)
@@ -69,18 +90,13 @@ def get_historical_baseline(symbol: str):
         atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
         
         returns = np.log(close / close_prev).dropna()
-        last_close = float(close.iloc[-1])
-
         return close, returns, atr
     except Exception:
         return None, None, None
 
 
 def get_live_quote_fast(symbol: str, fallback_price: float) -> float:
-    """
-    Ultra-Fast Network Call: Uncached.
-    Only fetches the single latest spot quote tick.
-    """
+    """Ultra-Fast Network Call: Fetches latest spot quote tick."""
     try:
         tk = yf.Ticker(symbol)
         price = float(tk.fast_info.last_price)
@@ -99,12 +115,12 @@ def get_live_quote_fast(symbol: str, fallback_price: float) -> float:
     return fallback_price
 
 
-def run_monte_carlo_fast(S0: float, mu: float, sigma: float, days: int, n_sims: int = 1000, model_type: str = "Standard (Normal Distribution)", log_returns=None, jump_params=None):
-    """Vectorized Monte Carlo engine using cumulative matrix operations for fast simulation."""
+def run_monte_carlo_fast(S0: float, mu: float, sigma: float, steps: int, n_sims: int = 1000, model_type: str = "Standard (Normal Distribution)", log_returns=None, jump_params=None):
+    """Vectorized Monte Carlo engine for multi-frequency interval steps."""
     dt = 1.0
     
     if model_type == "Standard (Normal Distribution)":
-        shocks = np.random.normal(0, 1, size=(days - 1, n_sims))
+        shocks = np.random.normal(0, 1, size=(steps - 1, n_sims))
         drift = (mu - 0.5 * sigma**2) * dt
         diffusion = sigma * np.sqrt(dt) * shocks
         daily_returns = drift + diffusion
@@ -112,21 +128,21 @@ def run_monte_carlo_fast(S0: float, mu: float, sigma: float, days: int, n_sims: 
     elif model_type == "Fat-Tail (Student's t)" and log_returns is not None:
         df_fit, _, _ = t.fit(log_returns)
         df_fit = max(df_fit, 3.0)
-        t_shocks = t.rvs(df_fit, size=(days - 1, n_sims)) / np.sqrt(df_fit / (df_fit - 2.0))
+        t_shocks = t.rvs(df_fit, size=(steps - 1, n_sims)) / np.sqrt(df_fit / (df_fit - 2.0))
         drift = (mu - 0.5 * sigma**2) * dt
         diffusion = sigma * np.sqrt(dt) * t_shocks
         daily_returns = drift + diffusion
 
     elif model_type == "Jump-Diffusion (Merton)" and jump_params is not None:
         j_lambda, j_mu, j_sigma = jump_params
-        shocks = np.random.normal(0, 1, size=(days - 1, n_sims))
-        n_jumps = np.random.poisson(j_lambda, size=(days - 1, n_sims))
-        jump_factor = np.random.normal(j_mu, j_sigma, size=(days - 1, n_sims)) * n_jumps
+        shocks = np.random.normal(0, 1, size=(steps - 1, n_sims))
+        n_jumps = np.random.poisson(j_lambda, size=(steps - 1, n_sims))
+        jump_factor = np.random.normal(j_mu, j_sigma, size=(steps - 1, n_sims)) * n_jumps
         drift = (mu - 0.5 * sigma**2 - j_lambda * (np.exp(j_mu + 0.5 * j_sigma**2) - 1)) * dt
         diffusion = sigma * np.sqrt(dt) * shocks
         daily_returns = drift + diffusion + jump_factor
     else:
-        daily_returns = np.zeros((days - 1, n_sims))
+        daily_returns = np.zeros((steps - 1, n_sims))
 
     zero_day = np.zeros((1, n_sims))
     cum_returns = np.vstack([zero_day, np.cumsum(daily_returns, axis=0)])
@@ -139,9 +155,9 @@ def run_monte_carlo_fast(S0: float, mu: float, sigma: float, days: int, n_sims: 
 # =========================================================
 if page == "📖 Beginner's Guide & Single Simulator":
     st.title("📈 Gipsy Trading AI")
-    st.caption("Live quantitative risk estimation & optimal trade targets for stocks, forex, and crypto.")
+    st.caption("Live quantitative risk estimation across intraday & daily timeframes.")
     
-    # --- Ultra-Fast Auto-Refresh Controls ---
+    # --- Auto-Refresh Controls ---
     st.sidebar.header("⚡ Live Data Feed Settings")
     auto_refresh_active = st.sidebar.toggle("Enable Live Auto-Refresh", value=True)
     refresh_rate_sec = st.sidebar.slider("Refresh Interval (Seconds)", 2, 30, 3, step=1)
@@ -150,41 +166,34 @@ if page == "📖 Beginner's Guide & Single Simulator":
         st.cache_data.clear()
 
     # --- Beginner Accordion ---
-    with st.expander("📖 New to Trading & Risk Modeling? Click here for the Beginner's Guide", expanded=False):
+    with st.expander("📖 New to Intraday Risk Modeling? Click here", expanded=False):
         st.markdown("""
-        ### 👋 Welcome to Gipsy Trading AI!
-        This tool uses mathematical statistical models to project thousands of potential future price paths for any asset in real time.
-
-        #### 1. Key Terminology Explained
-        * **Live Spot Price:** The last traded market quote fetched directly from exchange feeds.
-        * **ATR (Average True Range):** Measures daily market volatility noise. A high ATR means large daily swings.
-        * **Limit Entry:** Recommended buy level. It factors in volatility noise so you buy on a pull-back instead of chasing peaks.
-        * **Take Profit (TP1 / TP2):** Target prices to lock in profits based on statistical probability horizons.
-        * **Stop Loss (SL):** Protective exit level to prevent severe losses if the market moves against you.
-        * **Risk-to-Reward Ratio (R:R):** Compares potential loss against potential gain. Target **1 : 1.5 or higher**.
+        ### 👋 Intraday Simulation Guide
+        * **Candle Interval:** Defines the time step for each simulation period (e.g., 15-minute bars vs. Daily bars).
+        * **Forecast Horizon (Steps):** Number of future bars projected ahead. For instance, 20 steps on a 15m chart look 5 hours ahead.
         """)
 
     st.markdown("---")
 
     # Controls
     st.sidebar.header("🛠️ Simulation Setup")
-    experience_mode = st.sidebar.radio(
-        "Experience Level",
-        ["🐣 Beginner (Presets)", "⚙️ Advanced (Custom Math)"]
-    )
-
-    st.sidebar.markdown("---")
     user_ticker_input = st.sidebar.text_input("Asset Ticker Symbol", value="BTC-USD")
     ticker = sanitize_ticker(user_ticker_input)
 
-    forecast_days = st.sidebar.slider("Forecast Horizon (Days)", 14, 365, 60)
+    # Interval & Horizon Selection
+    candle_interval = st.sidebar.selectbox(
+        "Candle Timeframe Interval",
+        ["15m", "1h", "4h", "1d"],
+        index=1
+    )
+    
+    forecast_steps = st.sidebar.slider("Forecast Horizon (Steps Ahead)", 10, 100, 30)
 
+    experience_mode = st.sidebar.radio("Experience Level", ["🐣 Beginner (Presets)", "⚙️ Advanced (Custom Math)"])
+
+    st.sidebar.markdown("---")
     if experience_mode == "🐣 Beginner (Presets)":
-        risk_preset = st.sidebar.select_slider(
-            "Risk Profile",
-            options=["🛡️ Conservative", "⚖️ Balanced", "🚀 Aggressive"],
-            value="⚖️ Balanced"
-        )
+        risk_preset = st.sidebar.select_slider("Risk Profile", options=["🛡️ Conservative", "⚖️ Balanced", "🚀 Aggressive"], value="⚖️ Balanced")
         if risk_preset == "🛡️ Conservative":
             tp1_pct, tp2_pct, sl_atr_mult = 60, 75, 1.5
         elif risk_preset == "⚖️ Balanced":
@@ -192,35 +201,22 @@ if page == "📖 Beginner's Guide & Single Simulator":
         else:
             tp1_pct, tp2_pct, sl_atr_mult = 75, 90, 0.75
 
-        asset_profile = st.sidebar.selectbox(
-            "Market Category",
-            ["Crypto / High Volatility", "Major Stocks / ETFs", "Forex / Low Volatility"]
-        )
-        model_type = "Fat-Tail (Student's t)" if "Crypto" in asset_profile else "Standard (Normal Distribution)"
+        model_type = "Fat-Tail (Student's t)" if "USD" in ticker else "Standard (Normal Distribution)"
         n_simulations = 1000
         jump_params = None
     else:
-        model_type = st.sidebar.radio(
-            "Simulation Engine",
-            ["Standard (Normal Distribution)", "Fat-Tail (Student's t)", "Jump-Diffusion (Merton)"]
-        )
+        model_type = st.sidebar.radio("Simulation Engine", ["Standard (Normal Distribution)", "Fat-Tail (Student's t)", "Jump-Diffusion (Merton)"])
         n_simulations = st.sidebar.slider("Simulations", 500, 5000, 1000, step=500)
         tp1_pct = st.sidebar.slider("TP1 Target Percentile", 50, 80, 68)
         tp2_pct = st.sidebar.slider("TP2 Target Percentile", 70, 95, 80)
         sl_atr_mult = st.sidebar.slider("SL ATR Buffer Multiplier", 0.5, 3.0, 1.0, step=0.25)
-
         jump_params = None
-        if model_type == "Jump-Diffusion (Merton)":
-            j_lambda = st.sidebar.slider("Expected Market Shocks / Year", 1, 12, 4) / 252.0
-            j_mu = st.sidebar.slider("Average Shock Drop (%)", -20.0, 5.0, -5.0) / 100.0
-            j_sigma = st.sidebar.slider("Shock Uncertainty (%)", 1.0, 15.0, 5.0) / 100.0
-            jump_params = (j_lambda, j_mu, j_sigma)
 
-    # Fetch Baseline Data outside fragment (cached for 10 min)
-    close_data, log_returns, atr_14 = get_historical_baseline(ticker)
+    # Fetch Baseline Data with selected interval
+    close_data, log_returns, atr_14 = get_historical_baseline(ticker, candle_interval)
 
     if close_data is None:
-        st.error(f"❌ Could not load price data for **{ticker}**. Verify symbol formatting (e.g. BTC-USD, AAPL, EURUSD=X).")
+        st.error(f"❌ Could not load price data for **{ticker}** on interval **{candle_interval}**. Check symbol or timeframe availability.")
         st.stop()
 
     mu = float(log_returns.mean())
@@ -232,13 +228,11 @@ if page == "📖 Beginner's Guide & Single Simulator":
     # ---------------------------------------------------------
     @st.fragment(run_every=refresh_rate_sec if auto_refresh_active else None)
     def render_live_simulator_dashboard():
-        # Fetch ONLY the quick live tick
         S0 = get_live_quote_fast(ticker, fallback_price=fallback_last_price)
         decimals = 4 if S0 < 10 else 2
 
-        # Fast simulation run
         sim_matrix = run_monte_carlo_fast(
-            S0=S0, mu=mu, sigma=sigma, days=forecast_days, 
+            S0=S0, mu=mu, sigma=sigma, steps=forecast_steps, 
             n_sims=n_simulations, model_type=model_type, 
             log_returns=log_returns, jump_params=jump_params
         )
@@ -264,8 +258,7 @@ if page == "📖 Beginner's Guide & Single Simulator":
         reward_per_unit = tp_1 - optimal_entry
         rr_ratio = reward_per_unit / risk_per_unit if risk_per_unit > 0 else 0.0
 
-        # Display Metrics Banner
-        st.caption(f"🟢 **Live Data Stream Active:** `${S0:,.{decimals}f}` | Last Check: `{pd.Timestamp.now().strftime('%H:%M:%S UTC')}`")
+        st.caption(f"🟢 **Live Data Stream Active ({candle_interval} Interval):** `${S0:,.{decimals}f}` | Last Check: `{pd.Timestamp.now().strftime('%H:%M:%S UTC')}`")
         st.markdown("### 🚦 Trade Snapshot")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("1. Live Spot Price", f"${S0:.{decimals}f}")
@@ -274,14 +267,13 @@ if page == "📖 Beginner's Guide & Single Simulator":
         col4.metric("4. Protection Stop Loss", f"${stop_loss:.{decimals}f}", delta=f"{((stop_loss/optimal_entry)-1)*100:.1f}%", delta_color="inverse")
 
         st.markdown("---")
-
         col_left, col_right = st.columns([2, 1])
         with col_left:
             st.subheader("🎯 Trade Setup Breakdown")
             st.markdown(f"""
-            * **Asset:** `{ticker}`
-            * **Daily Volatility Noise (14-Day ATR):** `${atr_14:.{decimals}f}`
-            * **Optimal Limit Order Entry:** **`${optimal_entry:.{decimals}f}`** *(Avoids buying at peaks)*
+            * **Asset / Interval:** `{ticker}` @ `{candle_interval}`
+            * **Bar Volatility Noise (14-Bar ATR):** `${atr_14:.{decimals}f}`
+            * **Optimal Limit Order Entry:** **`${optimal_entry:.{decimals}f}`**
             * **Conservative Target (TP1):** **`${tp_1:.{decimals}f}`**
             * **Extended Target (TP2):** **`${tp_2:.{decimals}f}`**
             * **Stop Loss Boundary:** **`${stop_loss:.{decimals}f}`**
@@ -297,33 +289,15 @@ if page == "📖 Beginner's Guide & Single Simulator":
             else:
                 st.error("🔴 **High Risk** — Risk outweighs potential reward.")
 
-        # Position Size Calculator
-        with st.expander("🧮 Position Size Calculator"):
-            c1, c2 = st.columns(2)
-            account_size = c1.number_input("Account Balance ($)", value=10000, step=1000)
-            risk_pct = c2.slider("Risk Per Trade (%)", 0.5, 5.0, 1.0, step=0.5)
-            
-            max_risk_dollars = account_size * (risk_pct / 100.0)
-            risk_per_share = optimal_entry - stop_loss
-            
-            if risk_per_share > 0:
-                shares_to_buy = max_risk_dollars / risk_per_share
-                total_position_val = shares_to_buy * optimal_entry
-                st.markdown(f"""
-                * **Maximum Capital at Risk:** `${max_risk_dollars:,.2f}` ({risk_pct}% of balance)
-                * **Recommended Quantity to Buy:** `{shares_to_buy:,.4f}` units
-                * **Total Position Outlay:** `${total_position_val:,.2f}`
-                """)
-
         # Interactive Chart
         st.markdown("---")
-        st.subheader("📊 Projected Price Cone & Probability Horizon")
+        st.subheader(f"📊 Projected Price Cone ({forecast_steps} Steps Ahead @ {candle_interval})")
 
-        days_axis = np.arange(forecast_days)
+        steps_axis = np.arange(forecast_steps)
         fig = go.Figure()
 
         fig.add_trace(go.Scatter(
-            x=np.concatenate([days_axis, days_axis[::-1]]),
+            x=np.concatenate([steps_axis, steps_axis[::-1]]),
             y=np.concatenate([p95, p5[::-1]]),
             fill='toself',
             fillcolor='rgba(59, 130, 246, 0.12)',
@@ -333,7 +307,7 @@ if page == "📖 Beginner's Guide & Single Simulator":
         ))
 
         fig.add_trace(go.Scatter(
-            x=np.concatenate([days_axis, days_axis[::-1]]),
+            x=np.concatenate([steps_axis, steps_axis[::-1]]),
             y=np.concatenate([p75, p25[::-1]]),
             fill='toself',
             fillcolor='rgba(59, 130, 246, 0.25)',
@@ -343,7 +317,7 @@ if page == "📖 Beginner's Guide & Single Simulator":
         ))
 
         fig.add_trace(go.Scatter(
-            x=days_axis,
+            x=steps_axis,
             y=np.median(sim_matrix, axis=1),
             mode='lines',
             name='Median Path',
@@ -356,7 +330,7 @@ if page == "📖 Beginner's Guide & Single Simulator":
         fig.add_hline(y=stop_loss, line_dash="dash", line_color="rgb(239, 68, 68)", annotation_text="Stop Loss")
 
         fig.update_layout(
-            xaxis_title="Days Ahead",
+            xaxis_title=f"Candle Steps ({candle_interval})",
             yaxis_title="Price ($)",
             template="plotly_white",
             height=500,
@@ -365,7 +339,6 @@ if page == "📖 Beginner's Guide & Single Simulator":
 
         st.plotly_chart(fig, use_container_width=True)
 
-    # Execute fragment
     render_live_simulator_dashboard()
 
 
@@ -373,23 +346,17 @@ if page == "📖 Beginner's Guide & Single Simulator":
 # PAGE 2: MULTI-ASSET DASHBOARD WITH CONCURRENT FETCH
 # =========================================================
 elif page == "📊 Multi-Asset Summary Dashboard":
-    st.title("📊 Multi-Asset & Horizon Summary Dashboard")
-    st.caption("Compare returns, risk metrics, and trade boundaries across assets and horizons concurrently.")
+    st.title("📊 Multi-Asset & Multi-Interval Summary Dashboard")
+    st.caption("Compare trade targets across multiple tickers and intervals concurrently.")
 
     st.sidebar.header("⚙️ Dashboard Controls")
-    default_tickers_text = st.sidebar.text_area(
-        "Assets to Compare",
-        value="BTC-USD, ETH-USD, AAPL, MSFT, EURUSD=X"
-    )
+    default_tickers_text = st.sidebar.text_area("Assets to Compare", value="BTC-USD, ETH-USD, AAPL, MSFT")
     
-    selected_timelines = st.sidebar.multiselect(
-        "Forecast Timelines (Days)",
-        options=[14, 30, 60, 90, 180, 365],
-        default=[30, 60, 90]
-    )
+    selected_interval = st.sidebar.selectbox("Comparison Interval", ["15m", "1h", "4h", "1d"], index=1)
+    selected_steps_list = st.sidebar.multiselect("Forecast Steps Ahead", options=[10, 20, 30, 50, 100], default=[20, 50])
 
-    if not selected_timelines:
-        st.warning("⚠️ Select at least one timeline.")
+    if not selected_steps_list:
+        st.warning("⚠️ Select at least one step horizon.")
         st.stop()
 
     ticker_list = [sanitize_ticker(t) for t in default_tickers_text.split(",") if t.strip()]
@@ -398,7 +365,7 @@ elif page == "📊 Multi-Asset Summary Dashboard":
         summary_rows = []
         
         def process_ticker(t_symbol):
-            close_data, log_returns, atr_14 = get_historical_baseline(t_symbol)
+            close_data, log_returns, atr_14 = get_historical_baseline(t_symbol, selected_interval)
             if close_data is None or log_returns.empty:
                 return None
             S0 = get_live_quote_fast(t_symbol, fallback_price=float(close_data.iloc[-1]))
@@ -414,10 +381,9 @@ elif page == "📊 Multi-Asset Summary Dashboard":
             
             mu = float(log_returns.mean())
             sigma = float(log_returns.std())
-            ann_vol = sigma * np.sqrt(252) * 100
 
-            for days in selected_timelines:
-                sim_matrix = run_monte_carlo_fast(S0, mu, sigma, days, n_sims=1000)
+            for steps in selected_steps_list:
+                sim_matrix = run_monte_carlo_fast(S0, mu, sigma, steps, n_sims=1000)
                 final_prices = sim_matrix[-1, :]
 
                 median_final = float(np.median(final_prices))
@@ -431,9 +397,9 @@ elif page == "📊 Multi-Asset Summary Dashboard":
 
                 summary_rows.append({
                     "Ticker": t_symbol,
+                    "Interval": selected_interval,
                     "Live Price ($)": round(S0, 4 if S0 < 10 else 2),
-                    "Timeline (Days)": days,
-                    "Ann. Volatility (%)": round(ann_vol, 1),
+                    "Steps Ahead": steps,
                     "Median Outcome ($)": round(median_final, 4 if S0 < 10 else 2),
                     "Expected Return (%)": round(exp_return_pct, 2),
                     "5% Downside Risk (%)": round(var_5_pct, 2),
@@ -447,7 +413,7 @@ elif page == "📊 Multi-Asset Summary Dashboard":
     summary_df = st.session_state.get("summary_df", pd.DataFrame())
 
     if summary_df.empty:
-        st.error("No data could be retrieved. Check ticker symbols.")
+        st.error("No data could be retrieved. Check ticker symbols or interval limitations.")
         st.stop()
 
     st.subheader("📋 Comprehensive Asset Matrix")
@@ -462,7 +428,7 @@ elif page == "📊 Multi-Asset Summary Dashboard":
     st.download_button(
         label="📥 Download Matrix as CSV",
         data=csv_data,
-        file_name="gipsy_trading_ai_summary.csv",
+        file_name="gipsy_trading_ai_intraday_summary.csv",
         mime="text/csv"
     )
 
@@ -475,12 +441,22 @@ elif page == "📊 Multi-Asset Summary Dashboard":
             summary_df,
             x="Ticker",
             y="Expected Return (%)",
-            color="Timeline (Days)",
+            color="Steps Ahead",
             barmode="group",
-            title="Expected Return by Horizon (%)",
-            color_continuous_scale="Viridis"
+            title=f"Expected Return by Asset ({selected_interval} Interval)",
+            template="plotly_white"
         )
-        fig_returns.update_layout(template="plotly_white", height=400)
         st.plotly_chart(fig_returns, use_container_width=True)
-        
-      
+
+    with c2:
+        fig_vol = px.scatter(
+            summary_df,
+            x="5% Downside Risk (%)",
+            y="Expected Return (%)",
+            color="Ticker",
+            size="Steps Ahead",
+            title="Risk vs. Return Profile",
+            template="plotly_white"
+        )
+        st.plotly_chart(fig_vol, use_container_width=True)
+            
