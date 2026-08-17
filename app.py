@@ -23,10 +23,10 @@ st.caption("A smart risk-estimation tool for traders and investors.")
 with st.expander("❓ New to Monte Carlo? Click here for a 1-minute breakdown"):
     st.markdown("""
     ### What is this app doing?
-    Instead of giving you a single "magic prediction" for a stock, this tool simulates **thousands of possible future price paths** based on history.
+    Instead of giving you a single "magic prediction" for a stock, this tool simulates **thousands of possible future price paths** based on historical risk patterns.
     
     * **VaR (Value at Risk / 5th Percentile):** The "warning threshold." In 95% of simulated paths, your stock stays *above* this return level.
-    * **CVaR (Conditional VaR / Tail Loss):** The "worst-case average." If a major market crash *does* happen, this is the average loss you should prepare for.
+    * **CVaR (Conditional VaR / Tail Loss):** The "worst-case average." If a major market crash *does* happen, this is the average expected loss.
     """)
 
 # ---------------------------------------------------------
@@ -59,7 +59,7 @@ forecast_days = st.sidebar.slider(
 )
 
 # ---------------------------------------------------------
-# Data Fetching
+# Data Fetching & Processing
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600)
 def load_market_data(symbol):
@@ -206,13 +206,13 @@ with col_chart:
             opacity=0.25
         ))
     
-    # Highlight median outcome path
+    # Highlight median outcome path with valid Plotly color 'gold'
     median_path = np.median(sim_matrix, axis=1)
     fig.add_trace(go.Scatter(
         y=median_path,
         mode='lines',
         name='Expected Median Path',
-        line=dict(color='bold yellow', width=2.5)
+        line=dict(color='gold', width=2.5)
     ))
 
     fig.update_layout(
@@ -259,3 +259,4 @@ with col_risk:
             "💡 **Takeaway:** Focus on the **Catastrophic Crash Average**. "
             "Make sure your portfolio can handle this maximum loss level before investing!"
     )
+    
