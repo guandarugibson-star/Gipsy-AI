@@ -471,6 +471,6 @@ elif page == "📊 Multi-Asset Summary Dashboard":
     c1, c2 = st.columns(2)
 
     with c1:
-        fig_returns = px.bar(
+        fig_returns = px.bar()
             summary_df,
       
