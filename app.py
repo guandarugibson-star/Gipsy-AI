@@ -78,7 +78,7 @@ def get_historical_baseline(symbol: str):
 
 def get_live_quote_fast(symbol: str, fallback_price: float) -> float:
     """
-    Ultra-Fast Network Call: Uncached or cached for 1s.
+    Ultra-Fast Network Call: Uncached.
     Only fetches the single latest spot quote tick.
     """
     try:
@@ -228,7 +228,7 @@ if page == "📖 Beginner's Guide & Single Simulator":
     fallback_last_price = float(close_data.iloc[-1])
 
     # ---------------------------------------------------------
-    # ULTRA-FAST SMOOTH FRAGMENT (Runs in milliseconds)
+    # ULTRA-FAST SMOOTH FRAGMENT
     # ---------------------------------------------------------
     @st.fragment(run_every=refresh_rate_sec if auto_refresh_active else None)
     def render_live_simulator_dashboard():
@@ -265,7 +265,7 @@ if page == "📖 Beginner's Guide & Single Simulator":
         rr_ratio = reward_per_unit / risk_per_unit if risk_per_unit > 0 else 0.0
 
         # Display Metrics Banner
-        st.caption(f"🟢 **Ultra-Fast Stream Active:** `${S0:,.{decimals}f}` | Updated: `{pd.Timestamp.now().strftime('%H:%M:%S UTC')}`")
+        st.caption(f"🟢 **Live Data Stream Active:** `${S0:,.{decimals}f}` | Last Check: `{pd.Timestamp.now().strftime('%H:%M:%S UTC')}`")
         st.markdown("### 🚦 Trade Snapshot")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("1. Live Spot Price", f"${S0:.{decimals}f}")
@@ -471,4 +471,6 @@ elif page == "📊 Multi-Asset Summary Dashboard":
     c1, c2 = st.columns(2)
 
     with c1:
-        # Fixed using 
+        fig_returns = px.bar(
+            summary_df,
+      
