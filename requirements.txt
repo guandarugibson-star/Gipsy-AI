@@ -1,7 +1,9 @@
 streamlit
+scipy
 yfinance
 pandas
-matplotlib
+numpy
+
 
 
 
