@@ -22,7 +22,7 @@ page = st.sidebar.radio(
 )
 
 # ---------------------------------------------------------
-# Shared Helper Functions & Live Engine
+# Helper Functions & Optimized Live Engine
 # ---------------------------------------------------------
 def sanitize_ticker(symbol: str) -> str:
     """Sanitizes user input tickers for yfinance compatibility."""
@@ -33,35 +33,32 @@ def sanitize_ticker(symbol: str) -> str:
             return f"{coin}-USD"
     return symbol
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_market_data_live(symbol: str):
+@st.cache_data(ttl=600, show_spinner=False)
+def get_historical_baseline(symbol: str):
     """
-    Fetches historical daily data for volatility/ATR calculation
-    AND extracts the latest live intraday quote from Yahoo Finance.
+    Heavy Network Call: Cached for 10 minutes (600s).
+    Fetches 1-year daily data for ATR, log returns, and distribution stats.
     """
     try:
         tk = yf.Ticker(symbol)
-        
-        # Historical daily data for ATR and log-returns calculation
         df_hist = tk.history(period="1y")
         if df_hist.empty:
-            return None, None, None, None
+            return None, None, None
             
-        # Flatten MultiIndex columns if returned by yfinance
         if isinstance(df_hist.columns, pd.MultiIndex):
             df_hist.columns = df_hist.columns.get_level_values(0)
 
         df_hist = df_hist.rename(columns={col: col.capitalize() for col in df_hist.columns})
 
         if 'Close' not in df_hist.columns or 'High' not in df_hist.columns or 'Low' not in df_hist.columns:
-            return None, None, None, None
+            return None, None, None
 
         close = df_hist['Close'].dropna().astype(float)
         high = df_hist['High'].dropna().astype(float)
         low = df_hist['Low'].dropna().astype(float)
         
         if len(close) < 30:
-            return None, None, None, None
+            return None, None, None
 
         # Wilder's Exponential Smoothing for ATR
         close_prev = close.shift(1)
@@ -72,26 +69,35 @@ def load_market_data_live(symbol: str):
         atr = float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
         
         returns = np.log(close / close_prev).dropna()
+        last_close = float(close.iloc[-1])
 
-        # Extract Live Spot Price
-        latest_price = None
-        try:
-            latest_price = float(tk.fast_info.last_price)
-        except Exception:
-            pass
-
-        if latest_price is None or np.isnan(latest_price):
-            # Fallback to 1-minute intraday tick or last daily close
-            df_intraday = tk.history(period="1d", interval="1m")
-            if not df_intraday.empty and 'Close' in df_intraday.columns:
-                latest_price = float(df_intraday['Close'].iloc[-1])
-            else:
-                latest_price = float(close.iloc[-1])
-
-        return close, returns, atr, latest_price
-
+        return close, returns, atr
     except Exception:
-        return None, None, None, None
+        return None, None, None
+
+
+def get_live_quote_fast(symbol: str, fallback_price: float) -> float:
+    """
+    Ultra-Fast Network Call: Uncached or cached for 1s.
+    Only fetches the single latest spot quote tick.
+    """
+    try:
+        tk = yf.Ticker(symbol)
+        price = float(tk.fast_info.last_price)
+        if not np.isnan(price) and price > 0:
+            return price
+    except Exception:
+        pass
+        
+    try:
+        df_intraday = tk.history(period="1d", interval="1m")
+        if not df_intraday.empty and 'Close' in df_intraday.columns:
+            return float(df_intraday['Close'].iloc[-1])
+    except Exception:
+        pass
+
+    return fallback_price
+
 
 def run_monte_carlo_fast(S0: float, mu: float, sigma: float, days: int, n_sims: int = 1000, model_type: str = "Standard (Normal Distribution)", log_returns=None, jump_params=None):
     """Vectorized Monte Carlo engine using cumulative matrix operations for fast simulation."""
@@ -122,7 +128,6 @@ def run_monte_carlo_fast(S0: float, mu: float, sigma: float, days: int, n_sims: 
     else:
         daily_returns = np.zeros((days - 1, n_sims))
 
-    # Day 0 initialization
     zero_day = np.zeros((1, n_sims))
     cum_returns = np.vstack([zero_day, np.cumsum(daily_returns, axis=0)])
     
@@ -136,14 +141,13 @@ if page == "📖 Beginner's Guide & Single Simulator":
     st.title("📈 Gipsy Trading AI")
     st.caption("Live quantitative risk estimation & optimal trade targets for stocks, forex, and crypto.")
     
-    # --- Live Controls in Sidebar ---
-    st.sidebar.header("⚡ Live Data Feed")
-    col_ref1, col_ref2 = st.sidebar.columns(2)
-    if col_ref1.button("🔄 Refresh"):
-        st.cache_data.clear()
-        st.rerun()
+    # --- Ultra-Fast Auto-Refresh Controls ---
+    st.sidebar.header("⚡ Live Data Feed Settings")
+    auto_refresh_active = st.sidebar.toggle("Enable Live Auto-Refresh", value=True)
+    refresh_rate_sec = st.sidebar.slider("Refresh Interval (Seconds)", 2, 30, 3, step=1)
 
-    auto_refresh = col_ref2.checkbox("Auto (60s)", value=False)
+    if st.sidebar.button("🔄 Force Refresh All Data"):
+        st.cache_data.clear()
 
     # --- Beginner Accordion ---
     with st.expander("📖 New to Trading & Risk Modeling? Click here for the Beginner's Guide", expanded=False):
@@ -212,155 +216,157 @@ if page == "📖 Beginner's Guide & Single Simulator":
             j_sigma = st.sidebar.slider("Shock Uncertainty (%)", 1.0, 15.0, 5.0) / 100.0
             jump_params = (j_lambda, j_mu, j_sigma)
 
-    # Fetch Live Data
-    close_data, log_returns, atr_14, live_spot_price = load_market_data_live(ticker)
+    # Fetch Baseline Data outside fragment (cached for 10 min)
+    close_data, log_returns, atr_14 = get_historical_baseline(ticker)
 
     if close_data is None:
         st.error(f"❌ Could not load price data for **{ticker}**. Verify symbol formatting (e.g. BTC-USD, AAPL, EURUSD=X).")
         st.stop()
 
-    S0 = live_spot_price
     mu = float(log_returns.mean())
     sigma = float(log_returns.std())
-    decimals = 4 if S0 < 10 else 2
+    fallback_last_price = float(close_data.iloc[-1])
 
-    # Run Monte Carlo Engine
-    sim_matrix = run_monte_carlo_fast(
-        S0=S0, mu=mu, sigma=sigma, days=forecast_days, 
-        n_sims=n_simulations, model_type=model_type, 
-        log_returns=log_returns, jump_params=jump_params
-    )
+    # ---------------------------------------------------------
+    # ULTRA-FAST SMOOTH FRAGMENT (Runs in milliseconds)
+    # ---------------------------------------------------------
+    @st.fragment(run_every=refresh_rate_sec if auto_refresh_active else None)
+    def render_live_simulator_dashboard():
+        # Fetch ONLY the quick live tick
+        S0 = get_live_quote_fast(ticker, fallback_price=fallback_last_price)
+        decimals = 4 if S0 < 10 else 2
 
-    # Risk Metrics & Calculation Targets
-    final_prices = sim_matrix[-1, :]
-    p5_var = np.percentile(final_prices, 5)
-    p25 = np.percentile(sim_matrix, 25, axis=1)
-    p75 = np.percentile(sim_matrix, 75, axis=1)
-    p95 = np.percentile(sim_matrix, 95, axis=1)
-    p5 = np.percentile(sim_matrix, 5, axis=1)
+        # Fast simulation run
+        sim_matrix = run_monte_carlo_fast(
+            S0=S0, mu=mu, sigma=sigma, days=forecast_days, 
+            n_sims=n_simulations, model_type=model_type, 
+            log_returns=log_returns, jump_params=jump_params
+        )
 
-    p_tp1 = np.percentile(final_prices, tp1_pct)
-    p_tp2 = np.percentile(final_prices, tp2_pct)
+        final_prices = sim_matrix[-1, :]
+        p5_var = np.percentile(final_prices, 5)
+        p25 = np.percentile(sim_matrix, 25, axis=1)
+        p75 = np.percentile(sim_matrix, 75, axis=1)
+        p95 = np.percentile(sim_matrix, 95, axis=1)
+        p5 = np.percentile(sim_matrix, 5, axis=1)
 
-    optimal_entry = max(S0 - (0.5 * atr_14), S0 * 0.95)
-    stop_loss = max(optimal_entry - (sl_atr_mult * atr_14), p5_var)
-    stop_loss = max(stop_loss, S0 * 0.01)
+        p_tp1 = np.percentile(final_prices, tp1_pct)
+        p_tp2 = np.percentile(final_prices, tp2_pct)
 
-    tp_1 = max(p_tp1, optimal_entry + (1.5 * atr_14))
-    tp_2 = max(p_tp2, optimal_entry + (3.0 * atr_14))
+        optimal_entry = max(S0 - (0.5 * atr_14), S0 * 0.95)
+        stop_loss = max(optimal_entry - (sl_atr_mult * atr_14), p5_var)
+        stop_loss = max(stop_loss, S0 * 0.01)
 
-    risk_per_unit = optimal_entry - stop_loss
-    reward_per_unit = tp_1 - optimal_entry
-    rr_ratio = reward_per_unit / risk_per_unit if risk_per_unit > 0 else 0.0
+        tp_1 = max(p_tp1, optimal_entry + (1.5 * atr_14))
+        tp_2 = max(p_tp2, optimal_entry + (3.0 * atr_14))
 
-    # Display Metrics Banner
-    st.caption(f"🟢 **Live Market Quote Active:** `${S0:,.{decimals}f}` | Updated: {pd.Timestamp.now().strftime('%H:%M:%S UTC')}")
-    st.markdown("### 🚦 Trade Snapshot")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("1. Live Spot Price", f"${S0:.{decimals}f}")
-    col2.metric("2. Recommended Limit Entry", f"${optimal_entry:.{decimals}f}")
-    col3.metric("3. Target Take Profit (TP1)", f"${tp_1:.{decimals}f}", delta=f"+{((tp_1/optimal_entry)-1)*100:.1f}%")
-    col4.metric("4. Protection Stop Loss", f"${stop_loss:.{decimals}f}", delta=f"{((stop_loss/optimal_entry)-1)*100:.1f}%", delta_color="inverse")
+        risk_per_unit = optimal_entry - stop_loss
+        reward_per_unit = tp_1 - optimal_entry
+        rr_ratio = reward_per_unit / risk_per_unit if risk_per_unit > 0 else 0.0
 
-    st.markdown("---")
+        # Display Metrics Banner
+        st.caption(f"🟢 **Ultra-Fast Stream Active:** `${S0:,.{decimals}f}` | Updated: `{pd.Timestamp.now().strftime('%H:%M:%S UTC')}`")
+        st.markdown("### 🚦 Trade Snapshot")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("1. Live Spot Price", f"${S0:.{decimals}f}")
+        col2.metric("2. Recommended Limit Entry", f"${optimal_entry:.{decimals}f}")
+        col3.metric("3. Target Take Profit (TP1)", f"${tp_1:.{decimals}f}", delta=f"+{((tp_1/optimal_entry)-1)*100:.1f}%")
+        col4.metric("4. Protection Stop Loss", f"${stop_loss:.{decimals}f}", delta=f"{((stop_loss/optimal_entry)-1)*100:.1f}%", delta_color="inverse")
 
-    col_left, col_right = st.columns([2, 1])
-    with col_left:
-        st.subheader("🎯 Trade Setup Breakdown")
-        st.markdown(f"""
-        * **Asset:** `{ticker}`
-        * **Daily Volatility Noise (14-Day ATR):** `${atr_14:.{decimals}f}`
-        * **Optimal Limit Order Entry:** **`${optimal_entry:.{decimals}f}`** *(Avoids buying at peaks)*
-        * **Conservative Target (TP1):** **`${tp_1:.{decimals}f}`**
-        * **Extended Target (TP2):** **`${tp_2:.{decimals}f}`**
-        * **Stop Loss Boundary:** **`${stop_loss:.{decimals}f}`**
-        """)
+        st.markdown("---")
 
-    with col_right:
-        st.subheader("⚖️ Risk Setup Rating")
-        st.metric("Risk-to-Reward (R:R)", f"1 : {rr_ratio:.2f}")
-        if rr_ratio >= 1.5:
-            st.success("🟢 **Great Setup** (R:R ≥ 1:1.5)")
-        elif rr_ratio >= 1.0:
-            st.warning("🟡 **Acceptable Setup** (R:R ≥ 1:1.0)")
-        else:
-            st.error("🔴 **High Risk** — Risk outweighs potential reward.")
-
-    # Position Size Calculator
-    with st.expander("🧮 Position Size Calculator"):
-        c1, c2 = st.columns(2)
-        account_size = c1.number_input("Account Balance ($)", value=10000, step=1000)
-        risk_pct = c2.slider("Risk Per Trade (%)", 0.5, 5.0, 1.0, step=0.5)
-        
-        max_risk_dollars = account_size * (risk_pct / 100.0)
-        risk_per_share = optimal_entry - stop_loss
-        
-        if risk_per_share > 0:
-            shares_to_buy = max_risk_dollars / risk_per_share
-            total_position_val = shares_to_buy * optimal_entry
+        col_left, col_right = st.columns([2, 1])
+        with col_left:
+            st.subheader("🎯 Trade Setup Breakdown")
             st.markdown(f"""
-            * **Maximum Capital at Risk:** `${max_risk_dollars:,.2f}` ({risk_pct}% of balance)
-            * **Recommended Quantity to Buy:** `{shares_to_buy:,.4f}` units
-            * **Total Position Outlay:** `${total_position_val:,.2f}`
+            * **Asset:** `{ticker}`
+            * **Daily Volatility Noise (14-Day ATR):** `${atr_14:.{decimals}f}`
+            * **Optimal Limit Order Entry:** **`${optimal_entry:.{decimals}f}`** *(Avoids buying at peaks)*
+            * **Conservative Target (TP1):** **`${tp_1:.{decimals}f}`**
+            * **Extended Target (TP2):** **`${tp_2:.{decimals}f}`**
+            * **Stop Loss Boundary:** **`${stop_loss:.{decimals}f}`**
             """)
 
-    # Interactive Chart with Shaded Probability Cones
-    st.markdown("---")
-    st.subheader("📊 Projected Price Cone & Probability Horizon")
+        with col_right:
+            st.subheader("⚖️ Risk Setup Rating")
+            st.metric("Risk-to-Reward (R:R)", f"1 : {rr_ratio:.2f}")
+            if rr_ratio >= 1.5:
+                st.success("🟢 **Great Setup** (R:R ≥ 1:1.5)")
+            elif rr_ratio >= 1.0:
+                st.warning("🟡 **Acceptable Setup** (R:R ≥ 1:1.0)")
+            else:
+                st.error("🔴 **High Risk** — Risk outweighs potential reward.")
 
-    days_axis = np.arange(forecast_days)
-    fig = go.Figure()
+        # Position Size Calculator
+        with st.expander("🧮 Position Size Calculator"):
+            c1, c2 = st.columns(2)
+            account_size = c1.number_input("Account Balance ($)", value=10000, step=1000)
+            risk_pct = c2.slider("Risk Per Trade (%)", 0.5, 5.0, 1.0, step=0.5)
+            
+            max_risk_dollars = account_size * (risk_pct / 100.0)
+            risk_per_share = optimal_entry - stop_loss
+            
+            if risk_per_share > 0:
+                shares_to_buy = max_risk_dollars / risk_per_share
+                total_position_val = shares_to_buy * optimal_entry
+                st.markdown(f"""
+                * **Maximum Capital at Risk:** `${max_risk_dollars:,.2f}` ({risk_pct}% of balance)
+                * **Recommended Quantity to Buy:** `{shares_to_buy:,.4f}` units
+                * **Total Position Outlay:** `${total_position_val:,.2f}`
+                """)
 
-    # 5% to 95% Confidence Band
-    fig.add_trace(go.Scatter(
-        x=np.concatenate([days_axis, days_axis[::-1]]),
-        y=np.concatenate([p95, p5[::-1]]),
-        fill='toself',
-        fillcolor='rgba(59, 130, 246, 0.12)',
-        line=dict(color='rgba(255,255,255,0)'),
-        hoverinfo="skip",
-        name='90% Probability Band'
-    ))
+        # Interactive Chart
+        st.markdown("---")
+        st.subheader("📊 Projected Price Cone & Probability Horizon")
 
-    # 25% to 75% Confidence Band
-    fig.add_trace(go.Scatter(
-        x=np.concatenate([days_axis, days_axis[::-1]]),
-        y=np.concatenate([p75, p25[::-1]]),
-        fill='toself',
-        fillcolor='rgba(59, 130, 246, 0.25)',
-        line=dict(color='rgba(255,255,255,0)'),
-        hoverinfo="skip",
-        name='50% Probability Band'
-    ))
+        days_axis = np.arange(forecast_days)
+        fig = go.Figure()
 
-    # Median Outcome Path
-    fig.add_trace(go.Scatter(
-        x=days_axis,
-        y=np.median(sim_matrix, axis=1),
-        mode='lines',
-        name='Median Path',
-        line=dict(color="rgb(234, 179, 8)", width=3)
-    ))
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([days_axis, days_axis[::-1]]),
+            y=np.concatenate([p95, p5[::-1]]),
+            fill='toself',
+            fillcolor='rgba(59, 130, 246, 0.12)',
+            line=dict(color='rgba(255,255,255,0)'),
+            hoverinfo="skip",
+            name='90% Probability Band'
+        ))
 
-    fig.add_hline(y=optimal_entry, line_dash="dash", line_color="rgb(59, 130, 246)", annotation_text="Limit Entry")
-    fig.add_hline(y=tp_1, line_dash="dash", line_color="rgb(16, 185, 129)", annotation_text="TP 1")
-    fig.add_hline(y=tp_2, line_dash="dot", line_color="rgb(5, 150, 105)", annotation_text="TP 2")
-    fig.add_hline(y=stop_loss, line_dash="dash", line_color="rgb(239, 68, 68)", annotation_text="Stop Loss")
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([days_axis, days_axis[::-1]]),
+            y=np.concatenate([p75, p25[::-1]]),
+            fill='toself',
+            fillcolor='rgba(59, 130, 246, 0.25)',
+            line=dict(color='rgba(255,255,255,0)'),
+            hoverinfo="skip",
+            name='50% Probability Band'
+        ))
 
-    fig.update_layout(
-        xaxis_title="Days Ahead",
-        yaxis_title="Price ($)",
-        template="plotly_white",
-        height=500,
-        margin=dict(l=20, r=20, t=30, b=20)
-    )
+        fig.add_trace(go.Scatter(
+            x=days_axis,
+            y=np.median(sim_matrix, axis=1),
+            mode='lines',
+            name='Median Path',
+            line=dict(color="rgb(234, 179, 8)", width=3)
+        ))
 
-    st.plotly_chart(fig, use_container_width=True)
+        fig.add_hline(y=optimal_entry, line_dash="dash", line_color="rgb(59, 130, 246)", annotation_text="Limit Entry")
+        fig.add_hline(y=tp_1, line_dash="dash", line_color="rgb(16, 185, 129)", annotation_text="TP 1")
+        fig.add_hline(y=tp_2, line_dash="dot", line_color="rgb(5, 150, 105)", annotation_text="TP 2")
+        fig.add_hline(y=stop_loss, line_dash="dash", line_color="rgb(239, 68, 68)", annotation_text="Stop Loss")
 
-    if auto_refresh:
-        import time
-        time.sleep(60)
-        st.rerun()
+        fig.update_layout(
+            xaxis_title="Days Ahead",
+            yaxis_title="Price ($)",
+            template="plotly_white",
+            height=500,
+            margin=dict(l=20, r=20, t=30, b=20)
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Execute fragment
+    render_live_simulator_dashboard()
 
 
 # =========================================================
@@ -391,15 +397,21 @@ elif page == "📊 Multi-Asset Summary Dashboard":
     if st.button("🚀 Run Comparative Analysis") or "summary_df" not in st.session_state:
         summary_rows = []
         
-        # Parallel Multi-Ticker Fetching
-        with ThreadPoolExecutor(max_workers=min(10, len(ticker_list))) as executor:
-            data_map = list(executor.map(load_market_data_live, ticker_list))
-
-        for t_symbol, (close_data, log_returns, atr_14, live_spot_price) in zip(ticker_list, data_map):
+        def process_ticker(t_symbol):
+            close_data, log_returns, atr_14 = get_historical_baseline(t_symbol)
             if close_data is None or log_returns.empty:
+                return None
+            S0 = get_live_quote_fast(t_symbol, fallback_price=float(close_data.iloc[-1]))
+            return (t_symbol, close_data, log_returns, atr_14, S0)
+
+        with ThreadPoolExecutor(max_workers=min(10, len(ticker_list))) as executor:
+            data_results = list(executor.map(process_ticker, ticker_list))
+
+        for res in data_results:
+            if res is None:
                 continue
-                
-            S0 = live_spot_price
+            t_symbol, close_data, log_returns, atr_14, S0 = res
+            
             mu = float(log_returns.mean())
             sigma = float(log_returns.std())
             ann_vol = sigma * np.sqrt(252) * 100
@@ -446,7 +458,6 @@ elif page == "📊 Multi-Asset Summary Dashboard":
         hide_index=True
     )
 
-    # Export to CSV
     csv_data = summary_df.to_csv(index=False).encode('utf-8')
     st.download_button(
         label="📥 Download Matrix as CSV",
@@ -460,18 +471,4 @@ elif page == "📊 Multi-Asset Summary Dashboard":
     c1, c2 = st.columns(2)
 
     with c1:
-        st.markdown("##### Expected Return (%)")
-        fig_ret = px.bar(
-            summary_df, x="Ticker", y="Expected Return (%)",
-            color="Timeline (Days)", barmode="group", text_auto=".1f", template="plotly_white"
-        )
-        st.plotly_chart(fig_ret, use_container_width=True)
-
-    with c2:
-        st.markdown("##### 5% Downside Value-at-Risk (%)")
-        fig_var = px.bar(
-            summary_df, x="Ticker", y="5% Downside Risk (%)",
-            color="Timeline (Days)", barmode="group", text_auto=".1f", template="plotly_white"
-        )
-        st.plotly_chart(fig_var, use_container_width=True)
-    
+        st.markdown("#
