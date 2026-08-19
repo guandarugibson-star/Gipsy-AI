@@ -1,3 +1,4 @@
+import time
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -6,6 +7,7 @@ from scipy.stats import t
 import plotly.graph_objects as go
 import plotly.express as px
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 
 # ---------------------------------------------------------
 # Page Configuration & Navigation
@@ -22,54 +24,75 @@ page = st.sidebar.radio(
 )
 
 # ---------------------------------------------------------
-# Helper Functions & Quantitative Engines
+# Helper Functions & Quantitative Engines (With Retries)
 # ---------------------------------------------------------
+def retry_on_exception(retries=3, delay=1.5):
+    """Decorator to retry flaky network calls against Yahoo Finance."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_err = None
+            for attempt in range(retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_err = e
+                    time.sleep(delay * (attempt + 1))
+            return None
+        return wrapper
+    return decorator
+
+
 def sanitize_ticker(symbol: str) -> str:
     """
     Sanitizes user input tickers for yfinance compatibility.
-    Automatically formats crypto pairs (e.g., BTC -> BTC-USD) 
-    and forex currency pairs (e.g., EURUSD -> EURUSD=X).
+    Automatically formats crypto pairs and forex currency pairs.
     """
     symbol = symbol.strip().upper()
     
-    # Handle Crypto shortcuts
     crypto_bases = ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "BNB", "AVAX", "DOT", "LINK"]
     for coin in crypto_bases:
         if symbol.startswith(coin) and ("USD" in symbol or "=X" in symbol or "/" in symbol):
             return f"{coin}-USD"
             
-    # Handle Forex pairs entered cleanly like EURUSD, GBPUSD, USDJPY, AUDUSD, etc.
-    if len(symbol) == 6 and symbol.isalpha() and not "=" in symbol and not "-" in symbol:
+    if len(symbol) == 6 and symbol.isalpha() and "=" not in symbol and "-" not in symbol:
         return f"{symbol}=X"
         
     return symbol
 
+
 @st.cache_data(ttl=300, show_spinner=False)
+@retry_on_exception(retries=3, delay=1.0)
+def _fetch_raw_history(symbol: str, fetch_period: str, fetch_interval: str):
+    """Cached low-level fetcher for raw yfinance history dataframe."""
+    tk = yf.Ticker(symbol)
+    df_hist = tk.history(period=fetch_period, interval=fetch_interval)
+    if df_hist.empty:
+        return None
+    if isinstance(df_hist.columns, pd.MultiIndex):
+        df_hist.columns = df_hist.columns.get_level_values(0)
+    df_hist = df_hist.rename(columns={col: col.capitalize() for col in df_hist.columns})
+    return df_hist
+
+
 def get_historical_baseline(symbol: str, interval: str):
     """
-    Fetches historical data matching the requested interval.
-    Adjusts lookback windows based on yfinance constraints for intraday data.
+    Fetches and processes historical baseline data with interval resampling 
+    handled outside the cache layer to prevent pollution.
     """
     try:
         period_map = {
             "15m": "59d",
             "1h": "730d",
-            "4h": "730d",  # Resampled from 1h
+            "4h": "730d",
             "1d": "1y"
         }
         fetch_period = period_map.get(interval, "1y")
         fetch_interval = "1h" if interval == "4h" else interval
 
-        tk = yf.Ticker(symbol)
-        df_hist = tk.history(period=fetch_period, interval=fetch_interval)
-        
-        if df_hist.empty:
+        df_hist = _fetch_raw_history(symbol, fetch_period, fetch_interval)
+        if df_hist is None or df_hist.empty:
             return None, None, None
-            
-        if isinstance(df_hist.columns, pd.MultiIndex):
-            df_hist.columns = df_hist.columns.get_level_values(0)
-
-        df_hist = df_hist.rename(columns={col: col.capitalize() for col in df_hist.columns})
 
         if 'Close' not in df_hist.columns or 'High' not in df_hist.columns or 'Low' not in df_hist.columns:
             return None, None, None
@@ -105,8 +128,9 @@ def get_historical_baseline(symbol: str, interval: str):
         return None, None, None
 
 
+@retry_on_exception(retries=2, delay=0.5)
 def get_live_quote_fast(symbol: str, fallback_price: float) -> float:
-    """Ultra-Fast Network Call: Fetches latest spot quote tick."""
+    """Ultra-Fast Network Call: Fetches latest spot quote tick with fallbacks."""
     try:
         tk = yf.Ticker(symbol)
         price = float(tk.fast_info.last_price)
@@ -126,7 +150,7 @@ def get_live_quote_fast(symbol: str, fallback_price: float) -> float:
 
 
 def run_monte_carlo_fast(S0: float, mu: float, sigma: float, steps: int, n_sims: int = 1000, model_type: str = "Standard (Normal Distribution)", log_returns=None, jump_params=None):
-    """Vectorized Monte Carlo engine for multi-frequency interval steps."""
+    """Vectorized Monte Carlo engine supporting multiple statistical distributions."""
     dt = 1.0
     
     if model_type == "Standard (Normal Distribution)":
@@ -135,9 +159,12 @@ def run_monte_carlo_fast(S0: float, mu: float, sigma: float, steps: int, n_sims:
         diffusion = sigma * np.sqrt(dt) * shocks
         daily_returns = drift + diffusion
 
-    elif model_type == "Fat-Tail (Student's t)" and log_returns is not None:
-        df_fit, _, _ = t.fit(log_returns)
-        df_fit = max(df_fit, 3.0)
+    elif model_type == "Fat-Tail (Student's t)" and log_returns is not None and len(log_returns) > 10:
+        try:
+            df_fit, _, _ = t.fit(log_returns)
+            df_fit = max(df_fit, 3.0)
+        except Exception:
+            df_fit = 5.0
         t_shocks = t.rvs(df_fit, size=(steps - 1, n_sims)) / np.sqrt(df_fit / (df_fit - 2.0))
         drift = (mu - 0.5 * sigma**2) * dt
         diffusion = sigma * np.sqrt(dt) * t_shocks
@@ -152,7 +179,10 @@ def run_monte_carlo_fast(S0: float, mu: float, sigma: float, steps: int, n_sims:
         diffusion = sigma * np.sqrt(dt) * shocks
         daily_returns = drift + diffusion + jump_factor
     else:
-        daily_returns = np.zeros((steps - 1, n_sims))
+        shocks = np.random.normal(0, 1, size=(steps - 1, n_sims))
+        drift = (mu - 0.5 * sigma**2) * dt
+        diffusion = sigma * np.sqrt(dt) * shocks
+        daily_returns = drift + diffusion
 
     zero_day = np.zeros((1, n_sims))
     cum_returns = np.vstack([zero_day, np.cumsum(daily_returns, axis=0)])
@@ -161,10 +191,7 @@ def run_monte_carlo_fast(S0: float, mu: float, sigma: float, steps: int, n_sims:
 
 
 def calculate_optimal_trade_levels(sim_matrix, S0, atr_14):
-    """
-    Scans Monte Carlo simulation paths using MFE/MAE (Maximum Favorable / Adverse Excursion) 
-    to automatically derive mathematically sound entry, stop-loss, and take-profit targets.
-    """
+    """Derives mathematically sound entry, stop-loss, and take-profit targets using MFE/MAE."""
     path_minima = np.min(sim_matrix, axis=0)
     median_path_dip = np.percentile(path_minima, 25)
     optimal_entry = max(S0 - (0.5 * atr_14), median_path_dip)
@@ -202,6 +229,7 @@ if page == "📖 Beginner's Guide & Single Simulator":
 
     if st.sidebar.button("🔄 Force Refresh All Data"):
         st.cache_data.clear()
+        st.success("Cache cleared successfully!")
 
     with st.expander("📖 Guide to MFE/MAE Quantitative Optimization", expanded=False):
         st.markdown("""
@@ -235,8 +263,8 @@ if page == "📖 Beginner's Guide & Single Simulator":
 
     close_data, log_returns, atr_14 = get_historical_baseline(ticker, candle_interval)
 
-    if close_data is None:
-        st.error(f"❌ Could not load price data for **{ticker}** on interval **{candle_interval}**.")
+    if close_data is None or log_returns is None or log_returns.empty:
+        st.error(f"❌ Could not load or parse valid price data for **{ticker}** on interval **{candle_interval}**. Please verify the symbol or choose a different interval.")
         st.stop()
 
     mu = float(log_returns.mean())
@@ -245,8 +273,11 @@ if page == "📖 Beginner's Guide & Single Simulator":
 
     @st.fragment(run_every=refresh_rate_sec if auto_refresh_active else None)
     def render_live_simulator_dashboard():
+        if close_data is None or log_returns is None:
+            st.warning(f"⚠️ Baseline data missing for **{ticker}**.")
+            return
+
         S0 = get_live_quote_fast(ticker, fallback_price=fallback_last_price)
-        # Forex pairs and low-value crypto usually require 4 to 5 decimal places for clarity
         decimals = 4 if S0 < 10 else 2
 
         sim_matrix = run_monte_carlo_fast(
@@ -348,7 +379,7 @@ if page == "📖 Beginner's Guide & Single Simulator":
 
 
 # =========================================================
-# PAGE 2: MULTI-ASSET DASHBOARD WITH 12 ASSETS CONCURRENT FETCH
+# PAGE 2: MULTI-ASSET DASHBOARD WITH CONCURRENT FETCH
 # =========================================================
 elif page == "📊 Multi-Asset Summary Dashboard":
     st.title("📊 Multi-Asset & Multi-Interval Summary Dashboard")
@@ -356,7 +387,6 @@ elif page == "📊 Multi-Asset Summary Dashboard":
 
     st.sidebar.header("⚙️ Dashboard Controls")
     
-    # Pre-loaded with 12 distinct assets now natively featuring major forex crosses (EURUSD, GBPUSD, USDJPY) alongside crypto and stocks
     default_12_assets = "EURUSD, GBPUSD, USDJPY, BTC-USD, ETH-USD, SOL-USD, AAPL, MSFT, NVDA, AMZN, GC=F, CL=F"
     default_tickers_text = st.sidebar.text_area("Assets to Compare (Comma-separated)", value=default_12_assets, height=100)
     
@@ -374,7 +404,7 @@ elif page == "📊 Multi-Asset Summary Dashboard":
         
         def process_ticker(t_symbol):
             close_data, log_returns, atr_14 = get_historical_baseline(t_symbol, selected_interval)
-            if close_data is None or log_returns.empty:
+            if close_data is None or log_returns is None or log_returns.empty:
                 return None
             S0 = get_live_quote_fast(t_symbol, fallback_price=float(close_data.iloc[-1]))
             return (t_symbol, close_data, log_returns, atr_14, S0)
@@ -419,7 +449,7 @@ elif page == "📊 Multi-Asset Summary Dashboard":
     summary_df = st.session_state.get("summary_df", pd.DataFrame())
 
     if summary_df.empty:
-        st.error("No data could be retrieved. Check ticker symbols.")
+        st.error("No valid data could be retrieved for the specified tickers. Please verify your internet connection or ticker symbols.")
         st.stop()
 
     st.subheader("📋 Optimized Asset Target Matrix")
@@ -437,3 +467,4 @@ elif page == "📊 Multi-Asset Summary Dashboard":
         file_name="gipsy_currency_asset_trading_matrix.csv",
         mime="text/csv"
     )
+    
